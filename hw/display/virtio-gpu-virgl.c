@@ -25,6 +25,10 @@
 #define VIRGL_RENDERER_UNSTABLE_APIS
 #include <virglrenderer.h>
 
+#ifdef __APPLE__
+#include "helix/helix-frame-export.h"
+#endif
+
 #define NATIVE_HANDLE_SUPPORT_VERSION (1)
 
 struct virtio_gpu_virgl_resource {
@@ -1213,6 +1217,11 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
         error_report("virgl could not be initialized: %d", ret);
         return ret;
     }
+
+#ifdef __APPLE__
+    /* Initialize Helix frame export for zero-copy GPU frame sharing */
+    helix_frame_export_init();
+#endif
 
     gl->fence_poll = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                   virtio_gpu_fence_poll, g);

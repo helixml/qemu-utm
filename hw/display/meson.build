@@ -154,4 +154,7 @@ endif
 
 system_ss.add(when: 'CONFIG_OMAP', if_true: files('omap_lcdc.c'))
 
+# Helix frame export for zero-copy GPU frame sharing
+subdir('helix')
+
 modules += { 'hw-display': hw_display_modules }
