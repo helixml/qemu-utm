@@ -1220,7 +1220,7 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
 
 #ifdef __APPLE__
     /* Initialize Helix frame export for zero-copy GPU frame sharing */
-    helix_frame_export_init();
+    helix_frame_export_init(g, 5900); /* vsock port for frame export */
 #endif
 
     gl->fence_poll = timer_new_ms(QEMU_CLOCK_VIRTUAL,
