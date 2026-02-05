@@ -114,6 +114,10 @@ typedef struct HelixErrorResponse {
  * Frame export context - created per session
  */
 typedef struct HelixFrameExport {
+    /* Thread safety */
+    pthread_mutex_t mutex;
+    bool valid;  /* Set to false before destruction */
+
     /* Encoder state */
     VTCompressionSessionRef encoder_session;
     int32_t width;

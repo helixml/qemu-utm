@@ -83,22 +83,35 @@ static void encoder_output_callback(void *outputCallbackRefCon,
         return;
     }
 
+    /* Lock mutex for thread safety */
+    pthread_mutex_lock(&fe->mutex);
+
+    /* Check if struct is still valid */
+    if (!fe->valid) {
+        helix_log("[HELIX] encoder_output_callback: fe marked invalid, discarding frame");
+        pthread_mutex_unlock(&fe->mutex);
+        return;
+    }
+
     int64_t pts = (int64_t)sourceFrameRefCon;
 
     if (status != noErr) {
         helix_log("[HELIX] VideoToolbox encode failed: %d", (int)status);
         fe->encode_errors++;
+        pthread_mutex_unlock(&fe->mutex);
         return;
     }
 
     if (!sampleBuffer) {
         helix_log("[HELIX] encoder_output_callback: NULL sampleBuffer");
+        pthread_mutex_unlock(&fe->mutex);
         return;
     }
 
     /* Check if socket is still valid before processing */
     if (fe->vsock_fd < 0) {
         helix_log("[HELIX] encoder_output_callback: socket closed, discarding frame");
+        pthread_mutex_unlock(&fe->mutex);
         return;
     }
 
@@ -169,6 +182,7 @@ static void encoder_output_callback(void *outputCallbackRefCon,
         helix_log("[HELIX] Callback fired but socket already closed, discarding frame");
     }
 
+    pthread_mutex_unlock(&fe->mutex);
     free(response);
 }
 
@@ -338,6 +352,13 @@ IOSurfaceRef helix_get_iosurface_for_resource(void *virtio_gpu,
     void *mapped_data = NULL;
     uint64_t mapped_size = 0;
 
+    /* Skip resources that are too small (likely being destroyed/recreated) */
+    if (width < 64 || height < 64) {
+        helix_log("[HELIX] Resource %u dimensions too small (%ux%u), skipping",
+                 resource_id, width, height);
+        return NULL;
+    }
+
     /* Try method 1: Direct resource mapping (works for blob resources) */
     helix_log("[HELIX] Attempting direct resource map for resource %u", resource_id);
     ret = virgl_renderer_resource_map(resource_id, &mapped_data, &mapped_size);
@@ -388,6 +409,8 @@ IOSurfaceRef helix_get_iosurface_for_resource(void *virtio_gpu,
         /* Force context 0 before transfer (required for some resources) */
         virgl_renderer_force_ctx_0();
 
+        helix_log("[HELIX] About to call virgl_renderer_transfer_read_iov...");
+
         ret = virgl_renderer_transfer_read_iov(
             resource_id,
             0,          /* ctx_id */
@@ -399,6 +422,8 @@ IOSurfaceRef helix_get_iosurface_for_resource(void *virtio_gpu,
             &iov,
             1           /* iovec_cnt */
         );
+
+        helix_log("[HELIX] virgl_renderer_transfer_read_iov returned: ret=%d", ret);
 
         if (ret != 0) {
             helix_log("[HELIX] virgl_renderer_transfer_read_iov failed: ret=%d", ret);
@@ -551,21 +576,19 @@ static int handle_frame_request(HelixFrameExport *fe,
     }
 
     /*
-     * IMPORTANT: Regular virtio-gpu resources don't have Metal texture backing.
-     * Only scanout resources (those being displayed) get Metal textures via
-     * virgl_renderer_create_handle_for_scanout().
+     * IMPORTANT: We ONLY process explicit resource IDs from the guest.
      *
-     * If resource_id is 0, use the current scanout resource.
+     * We do NOT use scanout resources (resource_id=0) because:
+     * 1. Scanout is the main GNOME desktop, actively being rendered
+     * 2. We want headless container frames from PipeWire DmaBuf, not the desktop
+     * 3. Scanout resources can hang in virgl_renderer_transfer_read_iov() due to race conditions
+     *
+     * The guest must extract resource IDs from DmaBuf file descriptors and send them explicitly.
      */
     uint32_t resource_id = req->resource_id;
     if (resource_id == 0) {
-        resource_id = helix_get_scanout_resource(fe->virtio_gpu);
-        error_report("[HELIX] Using scanout resource_id=%u", resource_id);
-
-        if (resource_id == 0) {
-            error_report("[HELIX] No scanout resource set");
-            return HELIX_ERR_RESOURCE_NOT_FOUND;
-        }
+        error_report("[HELIX] resource_id=0 not supported - guest must provide explicit resource ID from DmaBuf");
+        return HELIX_ERR_RESOURCE_NOT_FOUND;
     }
 
     /* Look up IOSurface for this resource */
@@ -671,6 +694,14 @@ void helix_frame_export_cleanup(HelixFrameExport *fe)
 {
     if (!fe) return;
 
+    /* Mark struct as invalid to prevent callbacks from accessing it */
+    pthread_mutex_lock(&fe->mutex);
+    fe->valid = false;
+    pthread_mutex_unlock(&fe->mutex);
+
+    /* Wait for any pending callbacks to finish */
+    usleep(100000);  /* 100ms */
+
     if (fe->encoder_session) {
         VTCompressionSessionCompleteFrames(fe->encoder_session, kCMTimeInvalid);
         VTCompressionSessionInvalidate(fe->encoder_session);
@@ -680,6 +711,9 @@ void helix_frame_export_cleanup(HelixFrameExport *fe)
     if (fe->vsock_fd >= 0) {
         close(fe->vsock_fd);
     }
+
+    /* Destroy mutex */
+    pthread_mutex_destroy(&fe->mutex);
 
     free(fe);
 }
@@ -740,6 +774,10 @@ int helix_frame_export_init(void *virtio_gpu, int vsock_port)
         error_report("[HELIX-DEBUG] Failed to allocate HelixFrameExport");
         return -1;
     }
+
+    /* Initialize thread safety */
+    pthread_mutex_init(&fe->mutex, NULL);
+    fe->valid = true;
 
     fe->virtio_gpu = virtio_gpu;
     fe->vsock_fd = -1;
