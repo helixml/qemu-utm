@@ -1211,11 +1211,17 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
         virtio_gpu_3d_cbs.get_egl_display = virgl_get_egl_display;
     }
 #endif
+    error_report("[HELIX-DEBUG] qemu_egl_angle_native_device=%p", qemu_egl_angle_native_device);
+
     if (qemu_egl_angle_native_device) {
 #if defined(VIRGL_RENDERER_NATIVE_SHARE_TEXTURE)
         flags |= VIRGL_RENDERER_NATIVE_SHARE_TEXTURE;
+        error_report("[HELIX-DEBUG] Added VIRGL_RENDERER_NATIVE_SHARE_TEXTURE flag");
 #elif defined(VIRGL_RENDERER_D3D11_SHARE_TEXTURE) && defined(WIN32)
         flags |= VIRGL_RENDERER_D3D11_SHARE_TEXTURE;
+        error_report("[HELIX-DEBUG] Added VIRGL_RENDERER_D3D11_SHARE_TEXTURE flag");
+#else
+        error_report("[HELIX-DEBUG] No native share texture flag available");
 #endif
     }
 #if VIRGL_VERSION_MAJOR >= 1
@@ -1228,7 +1234,7 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
 #endif
 
     /* Debug: Log virgl init */
-    error_report("[HELIX-DEBUG] About to call virgl_renderer_init");
+    error_report("[HELIX-DEBUG] About to call virgl_renderer_init with flags=0x%x", flags);
 
     ret = virgl_renderer_init(g, flags, &virtio_gpu_3d_cbs);
     if (ret != 0) {
