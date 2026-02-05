@@ -76,15 +76,29 @@ static void encoder_output_callback(void *outputCallbackRefCon,
                                     CMSampleBufferRef sampleBuffer)
 {
     HelixFrameExport *fe = (HelixFrameExport *)outputCallbackRefCon;
+
+    /* Safety check: ensure fe is valid */
+    if (!fe) {
+        fprintf(stderr, "[HELIX] encoder_output_callback: NULL fe pointer!\n");
+        return;
+    }
+
     int64_t pts = (int64_t)sourceFrameRefCon;
 
     if (status != noErr) {
-        error_report("VideoToolbox encode failed: %d\n", (int)status);
+        helix_log("[HELIX] VideoToolbox encode failed: %d", (int)status);
         fe->encode_errors++;
         return;
     }
 
     if (!sampleBuffer) {
+        helix_log("[HELIX] encoder_output_callback: NULL sampleBuffer");
+        return;
+    }
+
+    /* Check if socket is still valid before processing */
+    if (fe->vsock_fd < 0) {
+        helix_log("[HELIX] encoder_output_callback: socket closed, discarding frame");
         return;
     }
 
@@ -142,13 +156,17 @@ static void encoder_output_callback(void *outputCallbackRefCon,
     memcpy(response + sizeof(HelixFrameResponse) + sizeof(uint32_t),
            dataPtr, totalLength);
 
-    /* Send response over vsock */
-    ssize_t sent = send(fe->vsock_fd, response, response_size, 0);
-    if (sent < 0) {
-        error_report("Failed to send response: %s\n", strerror(errno));
+    /* Send response over vsock (check if socket is still open) */
+    if (fe->vsock_fd >= 0) {
+        ssize_t sent = send(fe->vsock_fd, response, response_size, 0);
+        if (sent < 0) {
+            error_report("Failed to send response: %s\n", strerror(errno));
+        } else {
+            fe->frames_encoded++;
+            fe->bytes_sent += sent;
+        }
     } else {
-        fe->frames_encoded++;
-        fe->bytes_sent += sent;
+        helix_log("[HELIX] Callback fired but socket already closed, discarding frame");
     }
 
     free(response);
@@ -567,14 +585,13 @@ static int handle_frame_request(HelixFrameExport *fe,
     IOSurfaceDecrementUseCount(surface);
 
     if (ret == HELIX_ERR_OK) {
-        /* Force encoder to complete this frame before returning (synchronous for testing) */
-        VTCompressionSessionCompleteFrames(fe->encoder_session, kCMTimeInvalid);
-        helix_log("[HELIX] Frame encoded and flushed successfully");
+        helix_log("[HELIX] Frame encode request submitted (async callback will send response)");
     } else {
         error_report("[HELIX] Frame encoding failed: %d", ret);
     }
 
-    return ret;
+    /* Don't return a response here - the VideoToolbox callback will send it asynchronously */
+    return HELIX_ERR_OK;
 }
 
 /*
@@ -820,9 +837,23 @@ static void *vsock_accept_thread(void *arg)
         vsock_server_thread(fe);
 
         /* Client disconnected */
-        error_report("[HELIX] Guest disconnected");
+        helix_log("[HELIX] Guest disconnected");
+
+        /* Close socket - callbacks will check vsock_fd < 0 before sending */
         close(client_fd);
-        fe->vsock_fd = listen_fd;  /* Back to listening */
+        fe->vsock_fd = -1;
+
+        /*
+         * DO NOT destroy encoder session here - VideoToolbox callbacks are async
+         * and may still fire. The callbacks check if vsock_fd < 0 and discard frames.
+         * The encoder session will be reused for the next client or destroyed on shutdown.
+         */
+
+        /* Sleep briefly to ensure any pending callbacks finish */
+        usleep(50000);  /* 50ms */
+
+        /* Back to listening */
+        fe->vsock_fd = listen_fd;
     }
 
     return NULL;
