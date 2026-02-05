@@ -409,6 +409,20 @@ IOSurfaceRef helix_get_iosurface_for_resource(void *virtio_gpu,
         /* Force context 0 before transfer (required for some resources) */
         virgl_renderer_force_ctx_0();
 
+        /* CRITICAL: Re-validate resource still exists before transfer
+         * The guest compositor can free scanout resources at any time.
+         * Without this check, virgl_renderer_transfer_read_iov() will crash
+         * trying to read from freed memory (race condition).
+         */
+        struct virgl_renderer_resource_info_ext recheck = {0};
+        ret = virgl_renderer_resource_get_info_ext(resource_id, &recheck);
+        if (ret != 0 || recheck.base.width != width || recheck.base.height != height) {
+            helix_log("[HELIX] Resource %u no longer valid (ret=%d) - likely freed by compositor",
+                     resource_id, ret);
+            free(pixel_data);
+            return NULL;
+        }
+
         helix_log("[HELIX] About to call virgl_renderer_transfer_read_iov...");
 
         ret = virgl_renderer_transfer_read_iov(
