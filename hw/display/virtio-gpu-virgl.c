@@ -27,6 +27,21 @@
 
 #ifdef __APPLE__
 #include "helix/helix-frame-export.h"
+
+/*
+ * Helper function for helix-frame-export to get scanout resource ID
+ * without needing to include virtio-gpu.h (which causes header conflicts)
+ */
+uint32_t virtio_gpu_get_scanout_resource_id(void *virtio_gpu, uint32_t scanout_idx)
+{
+    VirtIOGPU *g = (VirtIOGPU *)virtio_gpu;
+
+    if (scanout_idx >= VIRTIO_GPU_MAX_SCANOUTS) {
+        return 0;
+    }
+
+    return g->parent_obj.scanout[scanout_idx].resource_id;
+}
 #endif
 
 #define NATIVE_HANDLE_SUPPORT_VERSION (1)

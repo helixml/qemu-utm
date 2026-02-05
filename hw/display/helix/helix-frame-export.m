@@ -27,10 +27,19 @@
 /* virglrenderer includes */
 #include "virglrenderer.h"
 
-/* QEMU includes - paths will vary in actual QEMU tree */
-// #include "qemu/osdep.h"
-// #include "hw/virtio/virtio-gpu.h"
-// #include "qemu/error-report.h"
+/* Forward declarations */
+extern uint32_t virtio_gpu_get_scanout_resource_id(void *virtio_gpu, uint32_t scanout_idx);
+
+/* virglrenderer function that may not be in header (unstable API) */
+extern enum virgl_renderer_native_handle_type
+virgl_renderer_create_handle_for_scanout(uint32_t res_id,
+                                         uint32_t width,
+                                         uint32_t height,
+                                         uint32_t virgl_format,
+                                         uint32_t padding,
+                                         uint32_t stride,
+                                         uint32_t offset,
+                                         virgl_renderer_native_handle *handle);
 
 /* Placeholder for QEMU error reporting - also log to file */
 static void helix_log(const char *fmt, ...) {
@@ -251,6 +260,19 @@ static int create_encoder_session(HelixFrameExport *fe,
 }
 
 /*
+ * Get the current scanout resource ID
+ * Returns the resource_id of scanout 0, or 0 if none set
+ */
+static uint32_t helix_get_scanout_resource(void *virtio_gpu)
+{
+    uint32_t resource_id = virtio_gpu_get_scanout_resource_id(virtio_gpu, 0);
+
+    error_report("[HELIX] Current scanout[0] resource_id=%u", resource_id);
+
+    return resource_id;
+}
+
+/*
  * Look up IOSurface for a virtio-gpu resource (zero-copy)
  *
  * The MTLTexture MUST be backed by IOSurface. If not, this fails
@@ -260,6 +282,8 @@ IOSurfaceRef helix_get_iosurface_for_resource(void *virtio_gpu,
                                                uint32_t resource_id)
 {
     struct virgl_renderer_resource_info_ext info_ext = {0};
+    enum virgl_renderer_native_handle_type type;
+    virgl_renderer_native_handle handle;
 
     error_report("[HELIX] Looking up resource_id=%u", resource_id);
 
@@ -273,10 +297,35 @@ IOSurfaceRef helix_get_iosurface_for_resource(void *virtio_gpu,
                  resource_id, info_ext.native_type,
                  info_ext.base.width, info_ext.base.height, info_ext.base.depth);
 
+    /*
+     * If resource doesn't have Metal texture backing, try to create it.
+     * This is what virgl_cmd_set_scanout_blob does - call create_handle_for_scanout
+     * to convert a regular resource into a Metal texture.
+     */
     if (info_ext.native_type != VIRGL_NATIVE_HANDLE_METAL_TEXTURE) {
-        error_report("[HELIX] Resource %u is not a Metal texture (type=%d, expected %d)",
-                     resource_id, info_ext.native_type, VIRGL_NATIVE_HANDLE_METAL_TEXTURE);
-        return NULL;
+        error_report("[HELIX] Resource %u doesn't have Metal texture, creating one...", resource_id);
+
+        type = virgl_renderer_create_handle_for_scanout(
+            resource_id,
+            info_ext.base.width,
+            info_ext.base.height,
+            info_ext.base.virgl_format,
+            0,  /* padding */
+            info_ext.base.stride,
+            0,  /* offset */
+            &handle);
+
+        if (type != VIRGL_NATIVE_HANDLE_METAL_TEXTURE) {
+            error_report("[HELIX] create_handle_for_scanout failed: type=%d (expected %d)",
+                         type, VIRGL_NATIVE_HANDLE_METAL_TEXTURE);
+            return NULL;
+        }
+
+        error_report("[HELIX] Successfully created Metal texture for resource %u", resource_id);
+
+        /* Update info_ext with the new handle */
+        info_ext.native_type = type;
+        info_ext.native_handle = handle;
     }
 
     /* native_handle is MTLTexture* */
@@ -401,13 +450,22 @@ static int handle_frame_request(HelixFrameExport *fe,
      * Only scanout resources (those being displayed) get Metal textures via
      * virgl_renderer_create_handle_for_scanout().
      *
-     * For now, we need to request scanout resources specifically.
-     * TODO: Add a message type to request encoding of current scanout resource.
+     * If resource_id is 0, use the current scanout resource.
      */
+    uint32_t resource_id = req->resource_id;
+    if (resource_id == 0) {
+        resource_id = helix_get_scanout_resource(fe->virtio_gpu);
+        error_report("[HELIX] Using scanout resource_id=%u", resource_id);
+
+        if (resource_id == 0) {
+            error_report("[HELIX] No scanout resource set");
+            return HELIX_ERR_RESOURCE_NOT_FOUND;
+        }
+    }
 
     /* Look up IOSurface for this resource */
     IOSurfaceRef surface = helix_get_iosurface_for_resource(
-        fe->virtio_gpu, req->resource_id);
+        fe->virtio_gpu, resource_id);
 
     if (!surface) {
         error_report("[HELIX] Failed to get IOSurface for resource %u", req->resource_id);
