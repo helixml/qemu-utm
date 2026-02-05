@@ -16,6 +16,12 @@
 #include <CoreVideo/CoreVideo.h>
 #include <Metal/Metal.h>
 #include <sys/socket.h>
+#include <sys/un.h>
+#include <pthread.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <stdio.h>
 
 /* virglrenderer includes */
 #include "virglrenderer.h"
@@ -462,6 +468,11 @@ void helix_frame_export_cleanup(HelixFrameExport *fe)
 }
 
 /*
+ * Forward declaration
+ */
+static void *vsock_accept_thread(void *arg);
+
+/*
  * vsock server thread - listens for connections and processes messages
  */
 static void *vsock_server_thread(void *arg)
@@ -505,8 +516,11 @@ static void *vsock_server_thread(void *arg)
  */
 int helix_frame_export_init(void *virtio_gpu, int vsock_port)
 {
+    error_report("[HELIX-DEBUG] helix_frame_export_init called, vsock_port=%d", vsock_port);
+
     HelixFrameExport *fe = calloc(1, sizeof(HelixFrameExport));
     if (!fe) {
+        error_report("[HELIX-DEBUG] Failed to allocate HelixFrameExport");
         return -1;
     }
 
@@ -515,21 +529,98 @@ int helix_frame_export_init(void *virtio_gpu, int vsock_port)
     fe->session_id = 1;  /* Default session */
 
     /*
-     * TODO: Set up vsock listener on vsock_port
-     *
-     * In QEMU, this would use the virtio-vsock device.
-     * The guest connects to CID 2 (host), port HELIX_VSOCK_PORT.
-     *
-     * For now, this is a placeholder - actual vsock integration
-     * depends on QEMU's vsock implementation.
+     * Set up UNIX socket listener for helix frame export protocol
+     * Guest connects to this socket instead of true vsock (macOS doesn't have kernel vsock)
+     * Socket path: /tmp/helix-frame-export.sock
      */
+    const char *socket_path = "/tmp/helix-frame-export.sock";
 
-    error_report("Helix frame export initialized on vsock port %d\n", vsock_port);
+    /* Remove existing socket if present */
+    unlink(socket_path);
+
+    /* Create UNIX domain socket */
+    int listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (listen_fd < 0) {
+        error_report("Failed to create UNIX socket: %s\n", strerror(errno));
+        free(fe);
+        return -1;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+
+    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        error_report("Failed to bind UNIX socket: %s\n", strerror(errno));
+        close(listen_fd);
+        free(fe);
+        return -1;
+    }
+
+    if (listen(listen_fd, 1) < 0) {
+        error_report("Failed to listen on UNIX socket: %s\n", strerror(errno));
+        close(listen_fd);
+        unlink(socket_path);
+        free(fe);
+        return -1;
+    }
+
+    error_report("Helix frame export listening on %s (vsock port %d)\n",
+                 socket_path, vsock_port);
+
+    /* Accept connections in background thread */
+    pthread_t thread;
+    fe->vsock_fd = listen_fd;  /* Store listen fd temporarily */
+    if (pthread_create(&thread, NULL, vsock_accept_thread, fe) != 0) {
+        error_report("Failed to create accept thread: %s\n", strerror(errno));
+        close(listen_fd);
+        unlink(socket_path);
+        free(fe);
+        return -1;
+    }
+
+    pthread_detach(thread);
 
     /* Store in virtio-gpu device for later access */
     /* TODO: Add helix_frame_export field to VirtIOGPU struct */
 
     return 0;
+}
+
+/*
+ * Accept thread - waits for guest connections
+ */
+static void *vsock_accept_thread(void *arg)
+{
+    HelixFrameExport *fe = (HelixFrameExport *)arg;
+    int listen_fd = fe->vsock_fd;
+
+    while (1) {
+        error_report("Waiting for guest connection...\n");
+
+        int client_fd = accept(listen_fd, NULL, NULL);
+        if (client_fd < 0) {
+            if (errno == EINTR) continue;
+            error_report("Accept failed: %s\n", strerror(errno));
+            break;
+        }
+
+        error_report("Guest connected!\n");
+
+        /* Update vsock_fd to client connection */
+        fe->vsock_fd = client_fd;
+
+        /* Handle this client connection */
+        vsock_server_thread(fe);
+
+        /* Client disconnected */
+        error_report("Guest disconnected\n");
+        close(client_fd);
+        fe->vsock_fd = listen_fd;  /* Back to listening */
+    }
+
+    return NULL;
 }
 
 #endif /* __APPLE__ */

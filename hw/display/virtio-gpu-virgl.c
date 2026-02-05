@@ -1212,16 +1212,22 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
     }
 #endif
 
+    /* Debug: Log virgl init */
+    error_report("[HELIX-DEBUG] About to call virgl_renderer_init");
+
     ret = virgl_renderer_init(g, flags, &virtio_gpu_3d_cbs);
     if (ret != 0) {
+        error_report("[HELIX-DEBUG] virgl_renderer_init FAILED with ret=%d", ret);
         error_report("virgl could not be initialized: %d", ret);
         return ret;
     }
 
-#ifdef __APPLE__
+    error_report("[HELIX-DEBUG] virgl_renderer_init succeeded, calling helix_frame_export_init");
+
     /* Initialize Helix frame export for zero-copy GPU frame sharing */
     helix_frame_export_init(g, 5900); /* vsock port for frame export */
-#endif
+
+    error_report("[HELIX-DEBUG] helix_frame_export_init returned");
 
     gl->fence_poll = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                   virtio_gpu_fence_poll, g);
