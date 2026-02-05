@@ -22,6 +22,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdarg.h>
 
 /* virglrenderer includes */
 #include "virglrenderer.h"
@@ -31,8 +32,25 @@
 // #include "hw/virtio/virtio-gpu.h"
 // #include "qemu/error-report.h"
 
-/* Placeholder for QEMU error reporting */
-#define error_report(...) fprintf(stderr, "helix: " __VA_ARGS__)
+/* Placeholder for QEMU error reporting - also log to file */
+static void helix_log(const char *fmt, ...) {
+    FILE *f = fopen("/Users/luke/Library/Group Containers/WDNLXAD4W8.com.utmapp.UTM/helix-debug.log", "a");
+    if (f) {
+        va_list args;
+        va_start(args, fmt);
+        vfprintf(f, fmt, args);
+        fprintf(f, "\n");
+        va_end(args);
+        fclose(f);
+    }
+    va_list args;
+    va_start(args, fmt);
+    fprintf(stderr, "helix: ");
+    vfprintf(stderr, fmt, args);
+    fprintf(stderr, "\n");
+    va_end(args);
+}
+#define error_report(...) helix_log(__VA_ARGS__)
 
 /*
  * VideoToolbox encoder output callback
@@ -243,32 +261,43 @@ IOSurfaceRef helix_get_iosurface_for_resource(void *virtio_gpu,
 {
     struct virgl_renderer_resource_info_ext info_ext = {0};
 
+    error_report("[HELIX] Looking up resource_id=%u", resource_id);
+
     int ret = virgl_renderer_resource_get_info_ext(resource_id, &info_ext);
     if (ret != 0) {
-        error_report("virgl_renderer_resource_get_info_ext failed: %d\n", ret);
+        error_report("[HELIX] virgl_renderer_resource_get_info_ext failed: ret=%d", ret);
         return NULL;
     }
 
+    error_report("[HELIX] Resource %u: native_type=%d, width=%u, height=%u, depth=%u",
+                 resource_id, info_ext.native_type,
+                 info_ext.base.width, info_ext.base.height, info_ext.base.depth);
+
     if (info_ext.native_type != VIRGL_NATIVE_HANDLE_METAL_TEXTURE) {
-        error_report("Resource %u is not a Metal texture (type=%d)\n",
-                     resource_id, info_ext.native_type);
+        error_report("[HELIX] Resource %u is not a Metal texture (type=%d, expected %d)",
+                     resource_id, info_ext.native_type, VIRGL_NATIVE_HANDLE_METAL_TEXTURE);
         return NULL;
     }
 
     /* native_handle is MTLTexture* */
     id<MTLTexture> texture = (__bridge id<MTLTexture>)(void *)info_ext.native_handle;
     if (!texture) {
-        error_report("Resource %u has NULL Metal texture\n", resource_id);
+        error_report("[HELIX] Resource %u has NULL Metal texture", resource_id);
         return NULL;
     }
+
+    error_report("[HELIX] Got Metal texture %p for resource %u", texture, resource_id);
 
     /* Get IOSurface - texture MUST be backed by IOSurface for zero-copy */
     IOSurfaceRef surface = texture.iosurface;
     if (!surface) {
-        error_report("Metal texture has no IOSurface backing - "
-                     "virglrenderer must create IOSurface-backed textures\n");
+        error_report("[HELIX] Metal texture has no IOSurface backing - "
+                     "virglrenderer must create IOSurface-backed textures");
         return NULL;
     }
+
+    error_report("[HELIX] Got IOSurface %p (width=%zu, height=%zu)",
+                 surface, IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface));
 
     IOSurfaceIncrementUseCount(surface);
     return surface;
@@ -347,24 +376,42 @@ int helix_encode_iosurface(HelixFrameExport *fe,
 static int handle_frame_request(HelixFrameExport *fe,
                                  const HelixFrameRequest *req)
 {
+    error_report("[HELIX] Frame request: resource_id=%u, %ux%u, pts=%lld",
+                 req->resource_id, req->width, req->height, req->pts);
+
     /* Auto-configure encoder on first frame or resolution change */
     if (!fe->configured ||
         fe->width != (int32_t)req->width ||
         fe->height != (int32_t)req->height) {
 
+        error_report("[HELIX] Configuring encoder: %ux%u, 8Mbps, realtime",
+                     req->width, req->height);
+
         int ret = create_encoder_session(fe, req->width, req->height,
                                           8000000,  /* 8 Mbps default */
                                           true);    /* realtime */
         if (ret != 0) {
+            error_report("[HELIX] Failed to create encoder session");
             return HELIX_ERR_INTERNAL;
         }
     }
+
+    /*
+     * IMPORTANT: Regular virtio-gpu resources don't have Metal texture backing.
+     * Only scanout resources (those being displayed) get Metal textures via
+     * virgl_renderer_create_handle_for_scanout().
+     *
+     * For now, we need to request scanout resources specifically.
+     * TODO: Add a message type to request encoding of current scanout resource.
+     */
 
     /* Look up IOSurface for this resource */
     IOSurfaceRef surface = helix_get_iosurface_for_resource(
         fe->virtio_gpu, req->resource_id);
 
     if (!surface) {
+        error_report("[HELIX] Failed to get IOSurface for resource %u", req->resource_id);
+        error_report("[HELIX] NOTE: Only scanout resources have Metal texture backing");
         return HELIX_ERR_RESOURCE_NOT_FOUND;
     }
 
@@ -373,6 +420,12 @@ static int handle_frame_request(HelixFrameExport *fe,
                                       req->force_keyframe != 0);
 
     IOSurfaceDecrementUseCount(surface);
+
+    if (ret == HELIX_ERR_OK) {
+        error_report("[HELIX] Frame encoded successfully");
+    } else {
+        error_report("[HELIX] Frame encoding failed: %d", ret);
+    }
 
     return ret;
 }
@@ -602,16 +655,16 @@ static void *vsock_accept_thread(void *arg)
     int listen_fd = fe->vsock_fd;
 
     while (1) {
-        error_report("Waiting for guest connection...\n");
+        error_report("[HELIX] Waiting for guest connection...");
 
         int client_fd = accept(listen_fd, NULL, NULL);
         if (client_fd < 0) {
             if (errno == EINTR) continue;
-            error_report("Accept failed: %s\n", strerror(errno));
+            error_report("[HELIX] Accept failed: %s", strerror(errno));
             break;
         }
 
-        error_report("Guest connected!\n");
+        error_report("[HELIX] Guest connected!");
 
         /* Update vsock_fd to client connection */
         fe->vsock_fd = client_fd;
@@ -620,7 +673,7 @@ static void *vsock_accept_thread(void *arg)
         vsock_server_thread(fe);
 
         /* Client disconnected */
-        error_report("Guest disconnected\n");
+        error_report("[HELIX] Guest disconnected");
         close(client_fd);
         fe->vsock_fd = listen_fd;  /* Back to listening */
     }
