@@ -30,7 +30,7 @@
 /* Forward declarations */
 extern uint32_t virtio_gpu_get_scanout_resource_id(void *virtio_gpu, uint32_t scanout_idx);
 
-/* virglrenderer function that may not be in header (unstable API) */
+/* virglrenderer functions that may not be in header (unstable API) */
 extern enum virgl_renderer_native_handle_type
 virgl_renderer_create_handle_for_scanout(uint32_t res_id,
                                          uint32_t width,
@@ -40,6 +40,10 @@ virgl_renderer_create_handle_for_scanout(uint32_t res_id,
                                          uint32_t stride,
                                          uint32_t offset,
                                          virgl_renderer_native_handle *handle);
+
+extern void virgl_renderer_force_ctx_0(void);
+
+/* virgl_renderer_resource_map/unmap are in virglrenderer.h */
 
 /* Placeholder for QEMU error reporting - also log to file */
 static void helix_log(const char *fmt, ...) {
@@ -276,8 +280,9 @@ static uint32_t helix_get_scanout_resource(void *virtio_gpu)
  * Create IOSurface from virtio-gpu resource via readback
  *
  * Due to ANGLE layer, resources are GL textures wrapped by ANGLE,
- * not direct Metal textures. We use virgl_renderer_transfer_read_iov
- * to read pixel data, then create an IOSurface from it.
+ * not direct Metal textures. We try two approaches:
+ * 1. virgl_renderer_resource_map() - direct memory mapping (preferred)
+ * 2. virgl_renderer_transfer_read_iov() - explicit transfer (fallback)
  *
  * This involves one CPU copy, but it works with ANGLE.
  */
@@ -311,54 +316,80 @@ IOSurfaceRef helix_get_iosurface_for_resource(void *virtio_gpu,
     size_t row_bytes = width * bytes_per_pixel;
     size_t buffer_size = row_bytes * height;
 
-    /* Allocate buffer for pixel data */
-    void *pixel_data = malloc(buffer_size);
-    if (!pixel_data) {
-        helix_log("[HELIX] Failed to allocate %zu bytes for pixel data", buffer_size);
-        return NULL;
+    void *pixel_data = NULL;
+    void *mapped_data = NULL;
+    uint64_t mapped_size = 0;
+
+    /* Try method 1: Direct resource mapping (works for blob resources) */
+    helix_log("[HELIX] Attempting direct resource map for resource %u", resource_id);
+    ret = virgl_renderer_resource_map(resource_id, &mapped_data, &mapped_size);
+
+    if (ret == 0 && mapped_data && mapped_size >= buffer_size) {
+        helix_log("[HELIX] Successfully mapped resource %u: %p, size=%llu",
+                 resource_id, mapped_data, mapped_size);
+        pixel_data = malloc(buffer_size);
+        if (pixel_data) {
+            memcpy(pixel_data, mapped_data, buffer_size);
+            virgl_renderer_resource_unmap(resource_id);
+            helix_log("[HELIX] Copied %zu bytes from mapped resource", buffer_size);
+        } else {
+            virgl_renderer_resource_unmap(resource_id);
+            helix_log("[HELIX] Failed to allocate copy buffer");
+            return NULL;
+        }
+    } else {
+        /* Method 2: Transfer read (fallback for non-blob resources) */
+        helix_log("[HELIX] Resource map failed (ret=%d), trying transfer_read_iov", ret);
+
+        pixel_data = malloc(buffer_size);
+        if (!pixel_data) {
+            helix_log("[HELIX] Failed to allocate %zu bytes for pixel data", buffer_size);
+            return NULL;
+        }
+
+        struct iovec iov = {
+            .iov_base = pixel_data,
+            .iov_len = buffer_size
+        };
+
+        struct {
+            uint32_t x, y, z;
+            uint32_t w, h, d;
+        } box = {
+            .x = 0,
+            .y = 0,
+            .z = 0,
+            .w = width,
+            .h = height,
+            .d = 1
+        };
+
+        helix_log("[HELIX] Reading pixel data from resource %u (%ux%u) via transfer",
+                 resource_id, width, height);
+
+        /* Force context 0 before transfer (required for some resources) */
+        virgl_renderer_force_ctx_0();
+
+        ret = virgl_renderer_transfer_read_iov(
+            resource_id,
+            0,          /* ctx_id */
+            0,          /* level */
+            stride,     /* stride */
+            0,          /* layer_stride */
+            (struct virgl_box *)&box,
+            0,          /* offset */
+            &iov,
+            1           /* iovec_cnt */
+        );
+
+        if (ret != 0) {
+            helix_log("[HELIX] virgl_renderer_transfer_read_iov failed: ret=%d", ret);
+            free(pixel_data);
+            return NULL;
+        }
+
+        helix_log("[HELIX] Successfully read %zu bytes via transfer", buffer_size);
     }
-
-    /* Create iovec for virgl_renderer_transfer_read_iov */
-    struct iovec iov = {
-        .iov_base = pixel_data,
-        .iov_len = buffer_size
-    };
-
-    /* Transfer box - full resource (same layout as struct virgl_box) */
-    struct {
-        uint32_t x, y, z;
-        uint32_t w, h, d;
-    } box = {
-        .x = 0,
-        .y = 0,
-        .z = 0,
-        .w = width,
-        .h = height,
-        .d = 1
-    };
-
-    /* Read pixel data from resource */
-    helix_log("[HELIX] Reading pixel data from resource %u (%ux%u)", resource_id, width, height);
-
-    ret = virgl_renderer_transfer_read_iov(
-        resource_id,
-        0,          /* ctx_id */
-        0,          /* level */
-        stride,     /* stride */
-        0,          /* layer_stride */
-        (struct virgl_box *)&box,
-        0,          /* offset */
-        &iov,
-        1           /* iovec_cnt */
-    );
-
-    if (ret != 0) {
-        helix_log("[HELIX] virgl_renderer_transfer_read_iov failed: ret=%d", ret);
-        free(pixel_data);
-        return NULL;
-    }
-
-    helix_log("[HELIX] Successfully read %zu bytes from resource %u", buffer_size, resource_id);
 
     /* Create IOSurface from pixel data */
     CFMutableDictionaryRef props = CFDictionaryCreateMutable(
