@@ -516,14 +516,7 @@ static void *vsock_server_thread(void *arg)
  */
 int helix_frame_export_init(void *virtio_gpu, int vsock_port)
 {
-    error_report("[HELIX-DEBUG] helix_frame_export_init called, vsock_port=%d", vsock_port);
-
-    /* Create a marker file in CWD to prove this function was called */
-    FILE *marker = fopen("helix-init-called.txt", "w");
-    if (marker) {
-        fprintf(marker, "helix_frame_export_init was called at vsock_port %d\n", vsock_port);
-        fclose(marker);
-    }
+    error_report("[HELIX] Initializing frame export on vsock port %d", vsock_port);
 
     HelixFrameExport *fe = calloc(1, sizeof(HelixFrameExport));
     if (!fe) {
@@ -537,8 +530,13 @@ int helix_frame_export_init(void *virtio_gpu, int vsock_port)
 
     /*
      * Set up UNIX socket listener for helix frame export protocol
-     * Guest connects to this socket instead of true vsock (macOS doesn't have kernel vsock)
-     * Use relative path in QEMU's CWD instead of /tmp (sandboxing blocks /tmp)
+     *
+     * macOS doesn't have kernel vsock support, so we use UNIX socket + TCP proxy:
+     * - Socket created in QEMU's CWD (macOS sandbox blocks /tmp)
+     * - socat proxies TCP port 5900 to this socket
+     * - Guest connects to 10.0.2.2:5900 via QEMU user-mode networking
+     *
+     * For production, this should be replaced with virtserialport
      */
     const char *socket_path = "helix-frame-export.sock";
 
@@ -573,7 +571,7 @@ int helix_frame_export_init(void *virtio_gpu, int vsock_port)
         return -1;
     }
 
-    error_report("Helix frame export listening on %s (vsock port %d)\n",
+    error_report("[HELIX] Frame export ready: socket=%s, proxy=10.0.2.2:%d\n",
                  socket_path, vsock_port);
 
     /* Accept connections in background thread */
