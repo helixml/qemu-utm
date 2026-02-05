@@ -478,6 +478,9 @@ int helix_encode_iosurface(HelixFrameExport *fe,
 static int handle_frame_request(HelixFrameExport *fe,
                                  const HelixFrameRequest *req)
 {
+    helix_log("[HELIX] Frame request RAW: resource_id=%u, width=%u (0x%x), height=%u (0x%x), pts=%lld",
+             req->resource_id, req->width, req->width, req->height, req->height, req->pts);
+
     error_report("[HELIX] Frame request: resource_id=%u, %ux%u, pts=%lld",
                  req->resource_id, req->width, req->height, req->pts);
 
@@ -533,7 +536,9 @@ static int handle_frame_request(HelixFrameExport *fe,
     IOSurfaceDecrementUseCount(surface);
 
     if (ret == HELIX_ERR_OK) {
-        error_report("[HELIX] Frame encoded successfully");
+        /* Force encoder to complete this frame before returning (synchronous for testing) */
+        VTCompressionSessionCompleteFrames(fe->encoder_session, kCMTimeInvalid);
+        helix_log("[HELIX] Frame encoded and flushed successfully");
     } else {
         error_report("[HELIX] Frame encoding failed: %d", ret);
     }
