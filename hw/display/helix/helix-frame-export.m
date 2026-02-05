@@ -273,82 +273,135 @@ static uint32_t helix_get_scanout_resource(void *virtio_gpu)
 }
 
 /*
- * Look up IOSurface for a virtio-gpu resource (zero-copy)
+ * Create IOSurface from virtio-gpu resource via readback
  *
- * The MTLTexture MUST be backed by IOSurface. If not, this fails
- * and we need to modify virglrenderer to create IOSurface-backed textures.
+ * Due to ANGLE layer, resources are GL textures wrapped by ANGLE,
+ * not direct Metal textures. We use virgl_renderer_transfer_read_iov
+ * to read pixel data, then create an IOSurface from it.
+ *
+ * This involves one CPU copy, but it works with ANGLE.
  */
 IOSurfaceRef helix_get_iosurface_for_resource(void *virtio_gpu,
                                                uint32_t resource_id)
 {
     struct virgl_renderer_resource_info_ext info_ext = {0};
-    enum virgl_renderer_native_handle_type type;
-    virgl_renderer_native_handle handle;
 
-    error_report("[HELIX] Looking up resource_id=%u", resource_id);
+    helix_log("[HELIX] Looking up resource_id=%u", resource_id);
 
     int ret = virgl_renderer_resource_get_info_ext(resource_id, &info_ext);
     if (ret != 0) {
-        error_report("[HELIX] virgl_renderer_resource_get_info_ext failed: ret=%d", ret);
+        helix_log("[HELIX] virgl_renderer_resource_get_info_ext failed: ret=%d", ret);
         return NULL;
     }
 
-    error_report("[HELIX] Resource %u: native_type=%d, width=%u, height=%u, depth=%u",
-                 resource_id, info_ext.native_type,
-                 info_ext.base.width, info_ext.base.height, info_ext.base.depth);
+    uint32_t width = info_ext.base.width;
+    uint32_t height = info_ext.base.height;
+    uint32_t stride = info_ext.base.stride;
 
-    /*
-     * If resource doesn't have Metal texture backing, try to create it.
-     * This is what virgl_cmd_set_scanout_blob does - call create_handle_for_scanout
-     * to convert a regular resource into a Metal texture.
-     */
-    if (info_ext.native_type != VIRGL_NATIVE_HANDLE_METAL_TEXTURE) {
-        error_report("[HELIX] Resource %u doesn't have Metal texture, creating one...", resource_id);
+    helix_log("[HELIX] Resource %u: native_type=%d, width=%u, height=%u, stride=%u",
+             resource_id, info_ext.native_type, width, height, stride);
 
-        type = virgl_renderer_create_handle_for_scanout(
-            resource_id,
-            info_ext.base.width,
-            info_ext.base.height,
-            info_ext.base.virgl_format,
-            0,  /* padding */
-            info_ext.base.stride,
-            0,  /* offset */
-            &handle);
-
-        if (type != VIRGL_NATIVE_HANDLE_METAL_TEXTURE) {
-            error_report("[HELIX] create_handle_for_scanout failed: type=%d (expected %d)",
-                         type, VIRGL_NATIVE_HANDLE_METAL_TEXTURE);
-            return NULL;
-        }
-
-        error_report("[HELIX] Successfully created Metal texture for resource %u", resource_id);
-
-        /* Update info_ext with the new handle */
-        info_ext.native_type = type;
-        info_ext.native_handle = handle;
-    }
-
-    /* native_handle is MTLTexture* */
-    id<MTLTexture> texture = (__bridge id<MTLTexture>)(void *)info_ext.native_handle;
-    if (!texture) {
-        error_report("[HELIX] Resource %u has NULL Metal texture", resource_id);
+    if (width == 0 || height == 0) {
+        helix_log("[HELIX] Invalid resource dimensions");
         return NULL;
     }
 
-    error_report("[HELIX] Got Metal texture %p for resource %u", texture, resource_id);
+    /* Calculate buffer size (BGRA8888 = 4 bytes per pixel) */
+    size_t bytes_per_pixel = 4;
+    size_t row_bytes = width * bytes_per_pixel;
+    size_t buffer_size = row_bytes * height;
 
-    /* Get IOSurface - texture MUST be backed by IOSurface for zero-copy */
-    IOSurfaceRef surface = texture.iosurface;
+    /* Allocate buffer for pixel data */
+    void *pixel_data = malloc(buffer_size);
+    if (!pixel_data) {
+        helix_log("[HELIX] Failed to allocate %zu bytes for pixel data", buffer_size);
+        return NULL;
+    }
+
+    /* Create iovec for virgl_renderer_transfer_read_iov */
+    struct iovec iov = {
+        .iov_base = pixel_data,
+        .iov_len = buffer_size
+    };
+
+    /* Transfer box - full resource (same layout as struct virgl_box) */
+    struct {
+        uint32_t x, y, z;
+        uint32_t w, h, d;
+    } box = {
+        .x = 0,
+        .y = 0,
+        .z = 0,
+        .w = width,
+        .h = height,
+        .d = 1
+    };
+
+    /* Read pixel data from resource */
+    helix_log("[HELIX] Reading pixel data from resource %u (%ux%u)", resource_id, width, height);
+
+    ret = virgl_renderer_transfer_read_iov(
+        resource_id,
+        0,          /* ctx_id */
+        0,          /* level */
+        stride,     /* stride */
+        0,          /* layer_stride */
+        (struct virgl_box *)&box,
+        0,          /* offset */
+        &iov,
+        1           /* iovec_cnt */
+    );
+
+    if (ret != 0) {
+        helix_log("[HELIX] virgl_renderer_transfer_read_iov failed: ret=%d", ret);
+        free(pixel_data);
+        return NULL;
+    }
+
+    helix_log("[HELIX] Successfully read %zu bytes from resource %u", buffer_size, resource_id);
+
+    /* Create IOSurface from pixel data */
+    CFMutableDictionaryRef props = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 0,
+        &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks);
+
+    CFNumberRef widthNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &width);
+    CFNumberRef heightNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &height);
+    CFNumberRef bytesPerRow = CFNumberCreate(kCFAllocatorDefault, kCFNumberLongType, &row_bytes);
+    uint32_t pixelFormat = kCVPixelFormatType_32BGRA;
+    CFNumberRef pixelFormatNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &pixelFormat);
+
+    CFDictionarySetValue(props, kIOSurfaceWidth, widthNum);
+    CFDictionarySetValue(props, kIOSurfaceHeight, heightNum);
+    CFDictionarySetValue(props, kIOSurfaceBytesPerRow, bytesPerRow);
+    CFDictionarySetValue(props, kIOSurfacePixelFormat, pixelFormatNum);
+
+    CFRelease(widthNum);
+    CFRelease(heightNum);
+    CFRelease(bytesPerRow);
+    CFRelease(pixelFormatNum);
+
+    IOSurfaceRef surface = IOSurfaceCreate(props);
+    CFRelease(props);
+
     if (!surface) {
-        error_report("[HELIX] Metal texture has no IOSurface backing - "
-                     "virglrenderer must create IOSurface-backed textures");
+        helix_log("[HELIX] Failed to create IOSurface");
+        free(pixel_data);
         return NULL;
     }
 
-    error_report("[HELIX] Got IOSurface %p (width=%zu, height=%zu)",
-                 surface, IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface));
+    /* Lock IOSurface and copy pixel data */
+    IOSurfaceLock(surface, 0, NULL);
+    void *surface_base = IOSurfaceGetBaseAddress(surface);
+    memcpy(surface_base, pixel_data, buffer_size);
+    IOSurfaceUnlock(surface, 0, NULL);
 
-    IOSurfaceIncrementUseCount(surface);
+    free(pixel_data);
+
+    helix_log("[HELIX] Created IOSurface %p (%ux%u) from resource %u",
+             surface, width, height, resource_id);
+
     return surface;
 }
 
