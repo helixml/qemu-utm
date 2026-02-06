@@ -21,12 +21,18 @@
 #include "hw/virtio/virtio-gpu-pixman.h"
 
 #include "ui/egl-helpers.h"
+#include "ui/surface.h"
 
 #define VIRGL_RENDERER_UNSTABLE_APIS
 #include <virglrenderer.h>
 
 #ifdef __APPLE__
 #include "helix/helix-frame-export.h"
+
+/* Forward declaration */
+static void helix_update_scanout_displaysurface(VirtIOGPU *g,
+                                                 uint32_t scanout_id,
+                                                 uint32_t resource_id);
 
 /*
  * Helper function for helix-frame-export to get scanout resource ID
@@ -415,6 +421,11 @@ static void virgl_cmd_resource_flush(VirtIOGPU *g,
             continue;
         }
         virtio_gpu_rect_update(g, i, rf.r.x, rf.r.y, rf.r.width, rf.r.height);
+
+#ifdef __APPLE__
+        /* Update DisplaySurface copy for Helix frame export on damage */
+        helix_update_scanout_displaysurface(g, i, rf.resource_id);
+#endif
     }
 }
 
@@ -499,7 +510,154 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
         dpy_gl_scanout_disable(g->parent_obj.scanout[ss.scanout_id].con);
     }
     g->parent_obj.scanout[ss.scanout_id].resource_id = ss.resource_id;
+
+    error_report("[HELIX] virgl_cmd_set_scanout completed: scanout=%u, resource=%u",
+                 ss.scanout_id, ss.resource_id);
+
+#ifdef __APPLE__
+    /* Update DisplaySurface copy for Helix frame export (eliminates race condition) */
+    error_report("[HELIX] Calling helix_update_scanout_displaysurface...");
+    helix_update_scanout_displaysurface(g, ss.scanout_id, ss.resource_id);
+    error_report("[HELIX] helix_update_scanout_displaysurface returned");
+#else
+    error_report("[HELIX] WARNING: __APPLE__ not defined, skipping DisplaySurface creation");
+#endif
 }
+
+#ifdef __APPLE__
+/*
+ * Update scanout's DisplaySurface from GPU resource
+ * This creates a CPU-accessible copy that can be safely read anytime,
+ * eliminating the race condition where guest frees GPU resources.
+ */
+static void helix_update_scanout_displaysurface(VirtIOGPU *g,
+                                                 uint32_t scanout_id,
+                                                 uint32_t resource_id)
+{
+    error_report("[HELIX] helix_update_scanout_displaysurface called: scanout=%u, resource=%u",
+                 scanout_id, resource_id);
+
+    if (scanout_id >= g->parent_obj.conf.max_outputs) {
+        error_report("[HELIX] Invalid scanout_id %u >= max_outputs %u",
+                     scanout_id, g->parent_obj.conf.max_outputs);
+        return;
+    }
+
+    struct virtio_gpu_scanout *scanout = &g->parent_obj.scanout[scanout_id];
+
+    if (resource_id == 0) {
+        /* Scanout disabled */
+        error_report("[HELIX] Scanout disabled, freeing DisplaySurface if exists");
+        if (scanout->ds) {
+            qemu_free_displaysurface(scanout->ds);
+            scanout->ds = NULL;
+        }
+        return;
+    }
+
+    /* Get resource info */
+    struct virgl_renderer_resource_info_ext info_ext = {0};
+    int ret = virgl_renderer_resource_get_info_ext(resource_id, &info_ext);
+    if (ret != 0) {
+        error_report("[HELIX] virgl_renderer_resource_get_info_ext failed for resource %u: ret=%d",
+                     resource_id, ret);
+        return;
+    }
+
+    uint32_t width = info_ext.base.width;
+    uint32_t height = info_ext.base.height;
+    uint32_t stride = info_ext.base.stride;
+
+    if (width == 0 || height == 0) {
+        return;
+    }
+
+    /* Create or recreate DisplaySurface if dimensions changed */
+    if (!scanout->ds ||
+        surface_width(scanout->ds) != width ||
+        surface_height(scanout->ds) != height) {
+
+        if (scanout->ds) {
+            qemu_free_displaysurface(scanout->ds);
+        }
+
+        scanout->ds = qemu_create_displaysurface(width, height);
+        if (!scanout->ds) {
+            error_report("[HELIX] Failed to create DisplaySurface %ux%u", width, height);
+            return;
+        }
+
+        error_report("[HELIX] Created DisplaySurface %ux%u for scanout %u",
+                     width, height, scanout_id);
+    }
+
+    /* Copy GPU resource pixels to DisplaySurface */
+    size_t bytes_per_pixel = 4;  /* BGRA8888 */
+    size_t row_bytes = width * bytes_per_pixel;
+    size_t buffer_size = row_bytes * height;
+
+    void *dest_data = surface_data(scanout->ds);
+    uint32_t dest_stride = surface_stride(scanout->ds);
+
+    /* Allocate temporary buffer for readback */
+    void *pixel_data = malloc(buffer_size);
+    if (!pixel_data) {
+        error_report("[HELIX] Failed to allocate pixel buffer");
+        return;
+    }
+
+    struct iovec iov = {
+        .iov_base = pixel_data,
+        .iov_len = buffer_size
+    };
+
+    struct {
+        uint32_t x, y, z;
+        uint32_t w, h, d;
+    } box = {
+        .x = 0, .y = 0, .z = 0,
+        .w = width, .h = height, .d = 1
+    };
+
+    /* Force context 0 before transfer */
+    virgl_renderer_force_ctx_0();
+
+    /* Read pixels from GPU resource */
+    ret = virgl_renderer_transfer_read_iov(
+        resource_id,
+        0,          /* ctx_id */
+        0,          /* level */
+        stride,     /* stride */
+        0,          /* layer_stride */
+        (struct virgl_box *)&box,
+        0,          /* offset */
+        &iov,
+        1           /* iovec_cnt */
+    );
+
+    if (ret == 0) {
+        /* Copy to DisplaySurface (handle stride differences) */
+        if (dest_stride == row_bytes && stride == row_bytes) {
+            /* Fast path: strides match */
+            memcpy(dest_data, pixel_data, buffer_size);
+        } else {
+            /* Slow path: copy row by row */
+            for (uint32_t y = 0; y < height; y++) {
+                memcpy((uint8_t *)dest_data + y * dest_stride,
+                       (uint8_t *)pixel_data + y * row_bytes,
+                       row_bytes);
+            }
+        }
+
+        error_report("[HELIX] Updated DisplaySurface for scanout %u from resource %u (%ux%u)",
+                     scanout_id, resource_id, width, height);
+    } else {
+        error_report("[HELIX] virgl_renderer_transfer_read_iov failed: ret=%d", ret);
+    }
+
+    free(pixel_data);
+}
+#endif
 
 static void virgl_cmd_submit_3d(VirtIOGPU *g,
                                 struct virtio_gpu_ctrl_command *cmd)
@@ -973,6 +1131,14 @@ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
     }
 
     virtio_gpu_update_scanout(g, ss.scanout_id, &res->base, &fb, &ss.r);
+
+    error_report("[HELIX] virgl_cmd_set_scanout_blob completed: scanout=%u, resource=%u",
+                 ss.scanout_id, ss.resource_id);
+#ifdef __APPLE__
+    error_report("[HELIX] Calling helix_update_scanout_displaysurface from set_scanout_blob...");
+    helix_update_scanout_displaysurface(g, ss.scanout_id, ss.resource_id);
+    error_report("[HELIX] helix_update_scanout_displaysurface returned successfully");
+#endif
 }
 #endif
 

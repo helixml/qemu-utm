@@ -169,6 +169,13 @@ IOSurfaceRef helix_get_iosurface_for_resource(void *virtio_gpu,
                                                uint32_t resource_id);
 
 /*
+ * Get IOSurface from scanout DisplaySurface (safe, no race condition)
+ * Returns IOSurfaceRef (retained) or NULL
+ */
+IOSurfaceRef helix_get_iosurface_from_scanout(void *virtio_gpu,
+                                                uint32_t scanout_id);
+
+/*
  * Encode an IOSurface frame
  */
 int helix_encode_iosurface(HelixFrameExport *fe,

@@ -27,6 +27,58 @@
 /* virglrenderer includes */
 #include "virglrenderer.h"
 
+/* Forward declarations for QEMU types */
+#include <pixman.h>
+
+typedef struct DisplaySurface {
+    pixman_image_t *image;
+    uint8_t flags;
+    void *share_handle;
+    uint32_t share_handle_offset;
+} DisplaySurface;
+
+typedef struct VirtIOGPU VirtIOGPU;
+typedef struct virtio_gpu_scanout virtio_gpu_scanout;
+
+/* DisplaySurface helpers (from ui/surface.h) */
+static inline uint32_t surface_width(DisplaySurface *s) {
+    return pixman_image_get_width(s->image);
+}
+
+static inline uint32_t surface_height(DisplaySurface *s) {
+    return pixman_image_get_height(s->image);
+}
+
+static inline uint32_t surface_stride(DisplaySurface *s) {
+    return pixman_image_get_stride(s->image);
+}
+
+static inline void *surface_data(DisplaySurface *s) {
+    return pixman_image_get_data(s->image);
+}
+
+/* virtio-gpu scanout structure (minimal definition) */
+struct virtio_gpu_scanout {
+    void *con;              /* QemuConsole */
+    DisplaySurface *ds;
+    uint32_t width, height;
+    /* ... other fields not needed here ... */
+};
+
+/* virtio-gpu base structure (minimal definition) */
+#define VIRTIO_GPU_MAX_SCANOUTS 16
+typedef struct VirtIOGPUBase {
+    void *parent;
+    struct virtio_gpu_scanout scanout[VIRTIO_GPU_MAX_SCANOUTS];
+    /* ... other fields not needed here ... */
+} VirtIOGPUBase;
+
+/* virtio-gpu structure (minimal definition) */
+struct VirtIOGPU {
+    VirtIOGPUBase parent_obj;
+    /* ... other fields not needed here ... */
+};
+
 /* Forward declarations */
 extern uint32_t virtio_gpu_get_scanout_resource_id(void *virtio_gpu, uint32_t scanout_idx);
 
@@ -145,11 +197,64 @@ static void encoder_output_callback(void *outputCallbackRefCon,
         return;
     }
 
+    /* VideoToolbox outputs H.264 in avcc format (4-byte length prefixes).
+     * Convert to Annex B (start codes 0x00000001) for vsockenc. */
+    size_t annexb_size = totalLength; /* Start codes are same size as length prefixes */
+    uint8_t *annexb_data = malloc(annexb_size);
+    if (!annexb_data) {
+        error_report("Failed to allocate annexb buffer\n");
+        pthread_mutex_unlock(&fe->mutex);
+        return;
+    }
+
+    helix_log("[HELIX] Converting avcc to Annex B: input_size=%zu", totalLength);
+    size_t src_offset = 0;
+    size_t dst_offset = 0;
+    uint32_t nal_count_actual = 0;
+    while (src_offset < totalLength) {
+        /* Read 4-byte NAL length (big-endian) */
+        if (src_offset + 4 > totalLength) {
+            error_report("Invalid avcc data: truncated length prefix\n");
+            free(annexb_data);
+            pthread_mutex_unlock(&fe->mutex);
+            return;
+        }
+
+        uint32_t nal_len = ((uint8_t)dataPtr[src_offset] << 24) |
+                           ((uint8_t)dataPtr[src_offset + 1] << 16) |
+                           ((uint8_t)dataPtr[src_offset + 2] << 8) |
+                           ((uint8_t)dataPtr[src_offset + 3]);
+        src_offset += 4;
+
+        if (src_offset + nal_len > totalLength) {
+            error_report("Invalid avcc data: NAL length %u exceeds buffer\n", nal_len);
+            free(annexb_data);
+            pthread_mutex_unlock(&fe->mutex);
+            return;
+        }
+
+        /* Write Annex B start code */
+        annexb_data[dst_offset++] = 0x00;
+        annexb_data[dst_offset++] = 0x00;
+        annexb_data[dst_offset++] = 0x00;
+        annexb_data[dst_offset++] = 0x01;
+
+        /* Copy NAL data */
+        memcpy(annexb_data + dst_offset, dataPtr + src_offset, nal_len);
+        dst_offset += nal_len;
+        src_offset += nal_len;
+        nal_count_actual++;
+    }
+
+    helix_log("[HELIX] Converted %u NAL units, output_size=%zu", nal_count_actual, dst_offset);
+
     /* Build response message */
-    size_t response_size = sizeof(HelixFrameResponse) + sizeof(uint32_t) + totalLength;
+    size_t response_size = sizeof(HelixFrameResponse) + sizeof(uint32_t) + dst_offset;
     uint8_t *response = malloc(response_size);
     if (!response) {
         error_report("Failed to allocate response buffer\n");
+        free(annexb_data);
+        pthread_mutex_unlock(&fe->mutex);
         return;
     }
 
@@ -164,13 +269,15 @@ static void encoder_output_callback(void *outputCallbackRefCon,
     resp->pts = pts;
     resp->dts = CMTimeGetSeconds(decode_time) * 1000000000LL;
     resp->is_keyframe = is_keyframe ? 1 : 0;
-    resp->nal_count = 1;  /* Single NAL unit for now */
+    resp->nal_count = 1;  /* Single blob with Annex B data */
 
-    /* Write NAL size and data */
-    uint32_t nal_size = (uint32_t)totalLength;
+    /* Write NAL size and Annex B data */
+    uint32_t nal_size = (uint32_t)dst_offset;
     memcpy(response + sizeof(HelixFrameResponse), &nal_size, sizeof(nal_size));
     memcpy(response + sizeof(HelixFrameResponse) + sizeof(uint32_t),
-           dataPtr, totalLength);
+           annexb_data, dst_offset);
+
+    free(annexb_data);
 
     /* Send response over vsock (check if socket is still open) */
     if (fe->vsock_fd >= 0) {
@@ -419,16 +526,24 @@ IOSurfaceRef helix_get_iosurface_for_resource(void *virtio_gpu,
          * Without this check, virgl_renderer_transfer_read_iov() will crash
          * trying to read from freed memory (race condition).
          */
+        helix_log("[HELIX] Re-validating resource %u before transfer (race condition check)", resource_id);
         struct virgl_renderer_resource_info_ext recheck = {0};
         ret = virgl_renderer_resource_get_info_ext(resource_id, &recheck);
+        helix_log("[HELIX] Re-validation: ret=%d, width=%u->%u, height=%u->%u",
+                 ret, width, recheck.base.width, height, recheck.base.height);
+
         if (ret != 0 || recheck.base.width != width || recheck.base.height != height) {
-            helix_log("[HELIX] Resource %u no longer valid (ret=%d) - likely freed by compositor",
+            helix_log("[HELIX] ERROR: Resource %u no longer valid (ret=%d) - likely freed by compositor",
                      resource_id, ret);
+            helix_log("[HELIX] This is the race condition - scanout was freed between lookup and transfer");
             free(pixel_data);
             return NULL;
         }
+        helix_log("[HELIX] Resource %u still valid, proceeding with transfer", resource_id);
 
-        helix_log("[HELIX] About to call virgl_renderer_transfer_read_iov...");
+        helix_log("[HELIX] About to call virgl_renderer_transfer_read_iov (THIS IS WHERE CRASH HAPPENS IF RESOURCE FREED)...");
+        helix_log("[HELIX] Transfer params: resource=%u, ctx=0, stride=%u, box=(%ux%u)",
+                 resource_id, stride, width, height);
 
         ret = virgl_renderer_transfer_read_iov(
             resource_id,
@@ -442,7 +557,7 @@ IOSurfaceRef helix_get_iosurface_for_resource(void *virtio_gpu,
             1           /* iovec_cnt */
         );
 
-        helix_log("[HELIX] virgl_renderer_transfer_read_iov returned: ret=%d", ret);
+        helix_log("[HELIX] ✅ virgl_renderer_transfer_read_iov COMPLETED successfully: ret=%d", ret);
 
         if (ret != 0) {
             helix_log("[HELIX] virgl_renderer_transfer_read_iov failed: ret=%d", ret);
@@ -485,15 +600,134 @@ IOSurfaceRef helix_get_iosurface_for_resource(void *virtio_gpu,
     }
 
     /* Lock IOSurface and copy pixel data */
+    helix_log("[HELIX] Locking IOSurface %p to copy %zu bytes of pixel data", surface, buffer_size);
     IOSurfaceLock(surface, 0, NULL);
     void *surface_base = IOSurfaceGetBaseAddress(surface);
+    helix_log("[HELIX] IOSurface base address: %p, copying pixel data...", surface_base);
     memcpy(surface_base, pixel_data, buffer_size);
     IOSurfaceUnlock(surface, 0, NULL);
+    helix_log("[HELIX] IOSurface unlocked, pixel data copied successfully");
 
     free(pixel_data);
 
-    helix_log("[HELIX] Created IOSurface %p (%ux%u) from resource %u",
+    helix_log("[HELIX] ✅ Successfully created IOSurface %p (%ux%u) from resource %u",
              surface, width, height, resource_id);
+
+    return surface;
+}
+
+/*
+ * Get IOSurface from scanout DisplaySurface (SAFE - no race condition)
+ *
+ * This reads from the DisplaySurface (QEMU-managed memory) instead of
+ * directly from GPU resources. The DisplaySurface is updated during
+ * SET_SCANOUT and damage notifications, so it's always safe to read.
+ */
+IOSurfaceRef helix_get_iosurface_from_scanout(void *virtio_gpu,
+                                                uint32_t scanout_id)
+{
+    /* Include virtio-gpu header to access scanout structure */
+    VirtIOGPU *g = (VirtIOGPU *)virtio_gpu;
+
+    helix_log("[HELIX] helix_get_iosurface_from_scanout called: scanout_id=%u", scanout_id);
+
+    if (!g) {
+        helix_log("[HELIX] ERROR: virtio_gpu pointer is NULL");
+        return NULL;
+    }
+
+    if (scanout_id >= VIRTIO_GPU_MAX_SCANOUTS) {
+        helix_log("[HELIX] Invalid scanout_id %u", scanout_id);
+        return NULL;
+    }
+
+    struct virtio_gpu_scanout *scanout = &g->parent_obj.scanout[scanout_id];
+    helix_log("[HELIX] Got scanout pointer: %p", scanout);
+
+    DisplaySurface *ds = scanout->ds;
+    helix_log("[HELIX] DisplaySurface pointer: %p", ds);
+
+    if (!ds) {
+        helix_log("[HELIX] No DisplaySurface for scanout %u - not initialized yet", scanout_id);
+        helix_log("[HELIX] DisplaySurface must be created by SET_SCANOUT command first");
+        return NULL;
+    }
+
+    helix_log("[HELIX] DisplaySurface is valid, checking image pointer");
+    if (!ds->image) {
+        helix_log("[HELIX] ERROR: DisplaySurface->image is NULL");
+        return NULL;
+    }
+    helix_log("[HELIX] DisplaySurface->image is valid: %p", ds->image);
+
+    uint32_t width = surface_width(ds);
+    uint32_t height = surface_height(ds);
+    uint32_t stride = surface_stride(ds);
+    void *data = surface_data(ds);
+
+    if (!data || width == 0 || height == 0) {
+        helix_log("[HELIX] Invalid DisplaySurface dimensions: %ux%u", width, height);
+        return NULL;
+    }
+
+    helix_log("[HELIX] Reading from DisplaySurface: %ux%u, stride=%u", width, height, stride);
+
+    /* Calculate expected size */
+    size_t bytes_per_pixel = 4;  /* BGRA8888 */
+    size_t row_bytes = width * bytes_per_pixel;
+    size_t buffer_size = row_bytes * height;
+
+    /* Create IOSurface from DisplaySurface pixel data */
+    CFMutableDictionaryRef props = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 0,
+        &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks);
+
+    CFNumberRef widthNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &width);
+    CFNumberRef heightNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &height);
+    CFNumberRef bytesPerRow = CFNumberCreate(kCFAllocatorDefault, kCFNumberLongType, &row_bytes);
+    uint32_t pixelFormat = kCVPixelFormatType_32BGRA;
+    CFNumberRef pixelFormatNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &pixelFormat);
+
+    CFDictionarySetValue(props, kIOSurfaceWidth, widthNum);
+    CFDictionarySetValue(props, kIOSurfaceHeight, heightNum);
+    CFDictionarySetValue(props, kIOSurfaceBytesPerRow, bytesPerRow);
+    CFDictionarySetValue(props, kIOSurfacePixelFormat, pixelFormatNum);
+
+    CFRelease(widthNum);
+    CFRelease(heightNum);
+    CFRelease(bytesPerRow);
+    CFRelease(pixelFormatNum);
+
+    IOSurfaceRef surface = IOSurfaceCreate(props);
+    CFRelease(props);
+
+    if (!surface) {
+        helix_log("[HELIX] Failed to create IOSurface");
+        return NULL;
+    }
+
+    /* Lock IOSurface and copy pixel data from DisplaySurface */
+    IOSurfaceLock(surface, 0, NULL);
+    void *surface_base = IOSurfaceGetBaseAddress(surface);
+
+    /* Copy row by row in case strides differ */
+    if (stride == row_bytes) {
+        /* Fast path: strides match, single memcpy */
+        memcpy(surface_base, data, buffer_size);
+    } else {
+        /* Slow path: copy row by row */
+        for (uint32_t y = 0; y < height; y++) {
+            memcpy((uint8_t *)surface_base + y * row_bytes,
+                   (uint8_t *)data + y * stride,
+                   row_bytes);
+        }
+    }
+
+    IOSurfaceUnlock(surface, 0, NULL);
+
+    helix_log("[HELIX] ✅ Successfully created IOSurface %p (%ux%u) from DisplaySurface (scanout %u)",
+             surface, width, height, scanout_id);
 
     return surface;
 }
@@ -595,33 +829,31 @@ static int handle_frame_request(HelixFrameExport *fe,
     }
 
     /*
-     * Handle resource_id extraction:
-     * - If guest provides explicit resource_id (from DmaBuf), use it
-     * - If resource_id=0, fall back to current scanout resource
+     * NEW APPROACH: Read from DisplaySurface instead of GPU resource
      *
-     * On virtio-gpu (macOS/UTM), Mutter does NOT support DmaBuf export in headless mode,
-     * so the scanout fallback is required for video streaming to work.
+     * This eliminates the race condition where the guest compositor can free
+     * GPU resources while we're reading them. DisplaySurface is QEMU-managed
+     * CPU memory that's updated during SET_SCANOUT and damage notifications.
+     *
+     * The old approach (helix_get_iosurface_for_resource) would crash when the
+     * compositor freed scanout resources during workspace switches or screen
+     * changes. The new approach (helix_get_iosurface_from_scanout) reads from
+     * a stable DisplaySurface copy, just like SPICE does.
      */
-    uint32_t resource_id = req->resource_id;
-    if (resource_id == 0) {
-        resource_id = helix_get_scanout_resource(fe->virtio_gpu);
-        error_report("[HELIX] Using scanout resource_id=%u", resource_id);
+    helix_log("[HELIX] ═══════════════════════════════════════════════════════");
+    helix_log("[HELIX] Reading from scanout DisplaySurface (safe, no race condition)");
+    helix_log("[HELIX] Frame parameters: %ux%u, pts=%lld", req->width, req->height, req->pts);
 
-        if (resource_id == 0) {
-            error_report("[HELIX] No scanout resource available");
-            return HELIX_ERR_RESOURCE_NOT_FOUND;
-        }
-    }
-
-    /* Look up IOSurface for this resource */
-    IOSurfaceRef surface = helix_get_iosurface_for_resource(
-        fe->virtio_gpu, resource_id);
+    IOSurfaceRef surface = helix_get_iosurface_from_scanout(
+        fe->virtio_gpu, 0  /* scanout_id - always 0 for single display */);
 
     if (!surface) {
-        error_report("[HELIX] Failed to get IOSurface for resource %u", req->resource_id);
-        error_report("[HELIX] NOTE: Only scanout resources have Metal texture backing");
+        error_report("[HELIX] ❌ FAILED to get IOSurface from DisplaySurface");
+        error_report("[HELIX] DisplaySurface may not be initialized yet (no scanout set)");
         return HELIX_ERR_RESOURCE_NOT_FOUND;
     }
+
+    helix_log("[HELIX] ✅ IOSurface extraction from DisplaySurface successful, proceeding to encode");
 
     /* Encode the frame */
     int ret = helix_encode_iosurface(fe, surface, req->pts, req->duration,
