@@ -16,7 +16,8 @@
 #include <CoreVideo/CoreVideo.h>
 #include <Metal/Metal.h>
 #include <sys/socket.h>
-#include <sys/un.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <pthread.h>
 #include <string.h>
 #include <unistd.h>
@@ -999,8 +1000,8 @@ static void *vsock_server_thread(void *arg)
 int helix_frame_export_init(void *virtio_gpu, int vsock_port)
 {
     error_report("========================================");
-    error_report("[HELIX] VERSION: 2026-02-06-11:15-DisplaySurface-v3");
-    error_report("[HELIX] BUILD: Safe helper function for DisplaySurface access");
+    error_report("[HELIX] VERSION: 2026-02-06-v4-TCP-direct");
+    error_report("[HELIX] BUILD: TCP listener, no socat needed");
     error_report("========================================");
     error_report("[HELIX] Initializing frame export on vsock port %d", vsock_port);
 
@@ -1019,50 +1020,45 @@ int helix_frame_export_init(void *virtio_gpu, int vsock_port)
     fe->session_id = 1;  /* Default session */
 
     /*
-     * Set up UNIX socket listener for helix frame export protocol
+     * Set up TCP socket listener for helix frame export protocol
      *
-     * macOS doesn't have kernel vsock support, so we use UNIX socket + TCP proxy:
-     * - Socket created in QEMU's CWD (macOS sandbox blocks /tmp)
-     * - socat proxies TCP port 5900 to this socket
-     * - Guest connects to 10.0.2.2:5900 via QEMU user-mode networking
-     *
-     * For production, this should be replaced with virtserialport
+     * Guest connects to 10.0.2.2:<port> via QEMU user-mode networking.
+     * SLiRP forwards this to 127.0.0.1:<port> on the host, which is
+     * where we listen. No socat proxy needed.
      */
-    const char *socket_path = "helix-frame-export.sock";
-
-    /* Remove existing socket if present */
-    unlink(socket_path);
-
-    /* Create UNIX domain socket */
-    int listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
-        error_report("Failed to create UNIX socket: %s\n", strerror(errno));
+        error_report("Failed to create TCP socket: %s\n", strerror(errno));
         free(fe);
         return -1;
     }
 
-    struct sockaddr_un addr;
+    int optval = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+
+    struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    addr.sin_port = htons(vsock_port);
 
     if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        error_report("Failed to bind UNIX socket: %s\n", strerror(errno));
+        error_report("Failed to bind TCP socket on port %d: %s\n",
+                     vsock_port, strerror(errno));
         close(listen_fd);
         free(fe);
         return -1;
     }
 
     if (listen(listen_fd, 1) < 0) {
-        error_report("Failed to listen on UNIX socket: %s\n", strerror(errno));
+        error_report("Failed to listen on TCP socket: %s\n", strerror(errno));
         close(listen_fd);
-        unlink(socket_path);
         free(fe);
         return -1;
     }
 
-    error_report("[HELIX] Frame export ready: socket=%s, proxy=10.0.2.2:%d\n",
-                 socket_path, vsock_port);
+    error_report("[HELIX] Frame export ready: TCP 127.0.0.1:%d (guest: 10.0.2.2:%d)\n",
+                 vsock_port, vsock_port);
 
     /* Accept connections in background thread */
     pthread_t thread;
@@ -1070,7 +1066,6 @@ int helix_frame_export_init(void *virtio_gpu, int vsock_port)
     if (pthread_create(&thread, NULL, vsock_accept_thread, fe) != 0) {
         error_report("Failed to create accept thread: %s\n", strerror(errno));
         close(listen_fd);
-        unlink(socket_path);
         free(fe);
         return -1;
     }

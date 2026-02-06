@@ -1454,7 +1454,7 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
     error_report("[HELIX-DEBUG] virgl_renderer_init succeeded, calling helix_frame_export_init");
 
     /* Initialize Helix frame export for zero-copy GPU frame sharing */
-    helix_frame_export_init(g, 5900); /* vsock port for frame export */
+    helix_frame_export_init(g, 15937); /* TCP port for frame export */
 
     error_report("[HELIX-DEBUG] helix_frame_export_init returned");
 
