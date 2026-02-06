@@ -77,6 +77,9 @@ static void encoder_output_callback(void *outputCallbackRefCon,
 {
     HelixFrameExport *fe = (HelixFrameExport *)outputCallbackRefCon;
 
+    error_report("[HELIX] encoder_output_callback called: status=%d, sampleBuffer=%p",
+                 (int)status, sampleBuffer);
+
     /* Safety check: ensure fe is valid */
     if (!fe) {
         fprintf(stderr, "[HELIX] encoder_output_callback: NULL fe pointer!\n");
@@ -173,10 +176,12 @@ static void encoder_output_callback(void *outputCallbackRefCon,
     if (fe->vsock_fd >= 0) {
         ssize_t sent = send(fe->vsock_fd, response, response_size, 0);
         if (sent < 0) {
-            error_report("Failed to send response: %s\n", strerror(errno));
+            error_report("[HELIX] Failed to send response: %s\n", strerror(errno));
         } else {
             fe->frames_encoded++;
             fe->bytes_sent += sent;
+            error_report("[HELIX] Frame sent successfully: %zu bytes, pts=%lld, keyframe=%d",
+                         sent, pts, is_keyframe);
         }
     } else {
         helix_log("[HELIX] Callback fired but socket already closed, discarding frame");
@@ -590,19 +595,22 @@ static int handle_frame_request(HelixFrameExport *fe,
     }
 
     /*
-     * IMPORTANT: We ONLY process explicit resource IDs from the guest.
+     * Handle resource_id extraction:
+     * - If guest provides explicit resource_id (from DmaBuf), use it
+     * - If resource_id=0, fall back to current scanout resource
      *
-     * We do NOT use scanout resources (resource_id=0) because:
-     * 1. Scanout is the main GNOME desktop, actively being rendered
-     * 2. We want headless container frames from PipeWire DmaBuf, not the desktop
-     * 3. Scanout resources can hang in virgl_renderer_transfer_read_iov() due to race conditions
-     *
-     * The guest must extract resource IDs from DmaBuf file descriptors and send them explicitly.
+     * On virtio-gpu (macOS/UTM), Mutter does NOT support DmaBuf export in headless mode,
+     * so the scanout fallback is required for video streaming to work.
      */
     uint32_t resource_id = req->resource_id;
     if (resource_id == 0) {
-        error_report("[HELIX] resource_id=0 not supported - guest must provide explicit resource ID from DmaBuf");
-        return HELIX_ERR_RESOURCE_NOT_FOUND;
+        resource_id = helix_get_scanout_resource(fe->virtio_gpu);
+        error_report("[HELIX] Using scanout resource_id=%u", resource_id);
+
+        if (resource_id == 0) {
+            error_report("[HELIX] No scanout resource available");
+            return HELIX_ERR_RESOURCE_NOT_FOUND;
+        }
     }
 
     /* Look up IOSurface for this resource */
