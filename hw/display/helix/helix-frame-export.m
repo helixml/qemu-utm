@@ -385,10 +385,10 @@ static int create_encoder_session(HelixFrameExport *fe,
         CFRelease(bitrateRef);
     }
 
-    /* H.264 Main Profile, Level 4.1 (suitable for 1080p60) */
+    /* H.264 Baseline Profile for low-latency streaming (no B-frames) */
     VTSessionSetProperty(fe->encoder_session,
                          kVTCompressionPropertyKey_ProfileLevel,
-                         kVTProfileLevel_H264_Main_AutoLevel);
+                         kVTProfileLevel_H264_Baseline_AutoLevel);
 
     /* Prepare to encode */
     status = VTCompressionSessionPrepareToEncodeFrames(fe->encoder_session);
