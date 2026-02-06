@@ -576,7 +576,7 @@ static void helix_update_scanout_displaysurface(VirtIOGPU *g,
                                                  uint32_t scanout_id,
                                                  uint32_t resource_id)
 {
-    error_report("[HELIX] helix_update_scanout_displaysurface called: scanout=%u, resource=%u",
+    error_report("[HELIX-v3] helix_update_scanout_displaysurface called: scanout=%u, resource=%u",
                  scanout_id, resource_id);
 
     if (scanout_id >= g->parent_obj.conf.max_outputs) {

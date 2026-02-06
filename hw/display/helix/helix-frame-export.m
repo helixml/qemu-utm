@@ -626,7 +626,7 @@ IOSurfaceRef helix_get_iosurface_for_resource(void *virtio_gpu,
 IOSurfaceRef helix_get_iosurface_from_scanout(void *virtio_gpu,
                                                 uint32_t scanout_id)
 {
-    helix_log("[HELIX] helix_get_iosurface_from_scanout called: scanout_id=%u", scanout_id);
+    helix_log("[HELIX-v3] helix_get_iosurface_from_scanout called: scanout_id=%u", scanout_id);
 
     if (!virtio_gpu) {
         helix_log("[HELIX] ERROR: virtio_gpu pointer is NULL");
@@ -998,6 +998,10 @@ static void *vsock_server_thread(void *arg)
  */
 int helix_frame_export_init(void *virtio_gpu, int vsock_port)
 {
+    error_report("========================================");
+    error_report("[HELIX] VERSION: 2026-02-06-11:15-DisplaySurface-v3");
+    error_report("[HELIX] BUILD: Safe helper function for DisplaySurface access");
+    error_report("========================================");
     error_report("[HELIX] Initializing frame export on vsock port %d", vsock_port);
 
     HelixFrameExport *fe = calloc(1, sizeof(HelixFrameExport));
