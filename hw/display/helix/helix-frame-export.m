@@ -1156,7 +1156,7 @@ static void *vsock_server_thread(void *arg)
         HelixMsgHeader header;
         if (!read_exact_bytes(fe->vsock_fd, &header, sizeof(header))) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                error_report("[HELIX] Client recv timeout (30s idle), disconnecting");
+                error_report("[HELIX] Client recv timeout (10min idle), disconnecting");
             } else if (errno != EINTR) {
                 error_report("[HELIX] vsock recv error: %s", strerror(errno));
             }
@@ -1273,7 +1273,7 @@ static void *vsock_server_thread(void *arg)
 int helix_frame_export_init(void *virtio_gpu, int vsock_port)
 {
     error_report("========================================");
-    error_report("[HELIX] VERSION: 2026-02-06-v4-TCP-direct");
+    error_report("[HELIX] VERSION: 2026-02-06-v5-long-timeout");
     error_report("[HELIX] BUILD: TCP listener, no socat needed");
     error_report("========================================");
     error_report("[HELIX] Initializing frame export on vsock port %d", vsock_port);
@@ -1375,9 +1375,11 @@ static void *vsock_accept_thread(void *arg)
         int keepalive = 1;
         setsockopt(client_fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
 
-        /* Set receive timeout (30s) so recv() doesn't block forever on dead connections */
+        /* Set receive timeout (10 min) - must be long enough for idle desktops.
+         * PipeWire ScreenCast is damage-based: static screens produce zero frames.
+         * SO_KEEPALIVE handles dead connection detection at TCP level. */
         struct timeval tv;
-        tv.tv_sec = 30;
+        tv.tv_sec = 600;
         tv.tv_usec = 0;
         setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
