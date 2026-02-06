@@ -850,16 +850,113 @@ int helix_encode_iosurface(HelixFrameExport *fe,
 }
 
 /*
+ * Create IOSurface from raw pixel data received over the network.
+ * This is used when the guest sends SHM pixel data (resource_id=0)
+ * because the host can't read container-internal screen data from
+ * the VM's GPU resources or DisplaySurface.
+ */
+static IOSurfaceRef helix_create_iosurface_from_pixels(const uint8_t *pixel_data,
+                                                         size_t pixel_data_size,
+                                                         uint32_t width,
+                                                         uint32_t height,
+                                                         uint32_t stride,
+                                                         uint32_t format)
+{
+    if (!pixel_data || pixel_data_size == 0 || width == 0 || height == 0) {
+        helix_log("[HELIX] Invalid pixel data parameters");
+        return NULL;
+    }
+
+    /* Determine pixel format for IOSurface */
+    uint32_t pixel_format = kCVPixelFormatType_32BGRA;  /* default */
+    size_t bytes_per_pixel = 4;
+    if (format == HELIX_FORMAT_RGBA8888) {
+        pixel_format = kCVPixelFormatType_32RGBA;
+    }
+
+    size_t row_bytes = width * bytes_per_pixel;
+    size_t expected_size = stride * height;
+
+    /* Sanity check */
+    if (pixel_data_size < expected_size) {
+        helix_log("[HELIX] Pixel data too small: got %zu, expected %zu (%ux%u, stride=%u)",
+                  pixel_data_size, expected_size, width, height, stride);
+        /* Try with row_bytes if stride wasn't set correctly */
+        expected_size = row_bytes * height;
+        if (pixel_data_size < expected_size) {
+            helix_log("[HELIX] Still too small even with calculated stride, aborting");
+            return NULL;
+        }
+    }
+
+    /* Create IOSurface */
+    CFMutableDictionaryRef props = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 0,
+        &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks);
+
+    CFNumberRef widthNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &width);
+    CFNumberRef heightNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &height);
+    CFNumberRef bytesPerRow = CFNumberCreate(kCFAllocatorDefault, kCFNumberLongType, &row_bytes);
+    CFNumberRef pixelFormatNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &pixel_format);
+
+    CFDictionarySetValue(props, kIOSurfaceWidth, widthNum);
+    CFDictionarySetValue(props, kIOSurfaceHeight, heightNum);
+    CFDictionarySetValue(props, kIOSurfaceBytesPerRow, bytesPerRow);
+    CFDictionarySetValue(props, kIOSurfacePixelFormat, pixelFormatNum);
+
+    CFRelease(widthNum);
+    CFRelease(heightNum);
+    CFRelease(bytesPerRow);
+    CFRelease(pixelFormatNum);
+
+    IOSurfaceRef surface = IOSurfaceCreate(props);
+    CFRelease(props);
+
+    if (!surface) {
+        helix_log("[HELIX] Failed to create IOSurface from pixel data");
+        return NULL;
+    }
+
+    /* Copy pixel data into IOSurface */
+    IOSurfaceLock(surface, 0, NULL);
+    void *surface_base = IOSurfaceGetBaseAddress(surface);
+
+    if (stride == row_bytes) {
+        /* Fast path: strides match */
+        memcpy(surface_base, pixel_data, row_bytes * height);
+    } else {
+        /* Slow path: copy row by row (source stride != dest stride) */
+        for (uint32_t y = 0; y < height; y++) {
+            memcpy((uint8_t *)surface_base + y * row_bytes,
+                   pixel_data + y * stride,
+                   row_bytes);
+        }
+    }
+
+    IOSurfaceUnlock(surface, 0, NULL);
+
+    helix_log("[HELIX] Created IOSurface %p (%ux%u) from %zu bytes of pixel data",
+              surface, width, height, pixel_data_size);
+
+    return surface;
+}
+
+/*
  * Handle frame request from guest
+ *
+ * When pixel_data is non-NULL, the guest sent raw pixel data (SHM buffer)
+ * and we encode those pixels directly. Otherwise, we read from the VM's
+ * DisplaySurface (which shows the VM desktop, not container screens).
  */
 static int handle_frame_request(HelixFrameExport *fe,
-                                 const HelixFrameRequest *req)
+                                 const HelixFrameRequest *req,
+                                 uint8_t *pixel_data,
+                                 size_t pixel_data_size)
 {
-    helix_log("[HELIX] Frame request RAW: resource_id=%u, width=%u (0x%x), height=%u (0x%x), pts=%lld",
-             req->resource_id, req->width, req->width, req->height, req->height, req->pts);
-
-    error_report("[HELIX] Frame request: resource_id=%u, %ux%u, pts=%lld",
-                 req->resource_id, req->width, req->height, req->pts);
+    helix_log("[HELIX] Frame request: resource_id=%u, %ux%u, pts=%lld, pixel_data=%s (%zu bytes)",
+             req->resource_id, req->width, req->height, req->pts,
+             pixel_data ? "YES" : "NO", pixel_data_size);
 
     /* Auto-configure encoder on first frame or resolution change */
     if (!fe->configured ||
@@ -878,46 +975,46 @@ static int handle_frame_request(HelixFrameExport *fe,
         }
     }
 
-    /*
-     * NEW APPROACH: Read from DisplaySurface instead of GPU resource
-     *
-     * This eliminates the race condition where the guest compositor can free
-     * GPU resources while we're reading them. DisplaySurface is QEMU-managed
-     * CPU memory that's updated during SET_SCANOUT and damage notifications.
-     *
-     * The old approach (helix_get_iosurface_for_resource) would crash when the
-     * compositor freed scanout resources during workspace switches or screen
-     * changes. The new approach (helix_get_iosurface_from_scanout) reads from
-     * a stable DisplaySurface copy, just like SPICE does.
-     */
-    helix_log("[HELIX] ═══════════════════════════════════════════════════════");
-    helix_log("[HELIX] Reading from scanout DisplaySurface (safe, no race condition)");
-    helix_log("[HELIX] Frame parameters: %ux%u, pts=%lld", req->width, req->height, req->pts);
+    IOSurfaceRef surface = NULL;
 
-    IOSurfaceRef surface = helix_get_iosurface_from_scanout(
-        fe->virtio_gpu, 0  /* scanout_id - always 0 for single display */);
-
-    if (!surface) {
-        error_report("[HELIX] ❌ FAILED to get IOSurface from DisplaySurface");
-        error_report("[HELIX] DisplaySurface may not be initialized yet (no scanout set)");
-        return HELIX_ERR_RESOURCE_NOT_FOUND;
+    if (pixel_data && pixel_data_size > 0) {
+        /*
+         * Guest sent raw pixel data from container's screen capture.
+         * Create IOSurface directly from the received pixels.
+         * This is the correct path for container-internal video streaming.
+         */
+        helix_log("[HELIX] Using pixel data from guest (%zu bytes)", pixel_data_size);
+        surface = helix_create_iosurface_from_pixels(
+            pixel_data, pixel_data_size,
+            req->width, req->height, req->stride, req->format);
+    } else {
+        /*
+         * No pixel data - fall back to reading from VM's DisplaySurface.
+         * This captures the VM's own desktop, which is only useful for
+         * debugging or when the VM screen itself needs to be streamed.
+         */
+        helix_log("[HELIX] No pixel data, falling back to DisplaySurface");
+        surface = helix_get_iosurface_from_scanout(
+            fe->virtio_gpu, 0  /* scanout_id */);
     }
 
-    helix_log("[HELIX] ✅ IOSurface extraction from DisplaySurface successful, proceeding to encode");
+    if (!surface) {
+        error_report("[HELIX] Failed to get IOSurface for encoding");
+        return HELIX_ERR_RESOURCE_NOT_FOUND;
+    }
 
     /* Encode the frame */
     int ret = helix_encode_iosurface(fe, surface, req->pts, req->duration,
                                       req->force_keyframe != 0);
 
-    IOSurfaceDecrementUseCount(surface);
+    CFRelease(surface);
 
     if (ret == HELIX_ERR_OK) {
-        helix_log("[HELIX] Frame encode request submitted (async callback will send response)");
+        helix_log("[HELIX] Frame encode submitted (callback will send response)");
     } else {
         error_report("[HELIX] Frame encoding failed: %d", ret);
     }
 
-    /* Don't return a response here - the VideoToolbox callback will send it asynchronously */
     return HELIX_ERR_OK;
 }
 
@@ -958,7 +1055,7 @@ int helix_frame_export_process_msg(HelixFrameExport *fe,
         if (len < sizeof(HelixFrameRequest)) {
             return HELIX_ERR_INVALID_MSG;
         }
-        return handle_frame_request(fe, (const HelixFrameRequest *)data);
+        return handle_frame_request(fe, (const HelixFrameRequest *)data, NULL, 0);
 
     case HELIX_MSG_CONFIG_REQ:
         if (len < sizeof(HelixConfigRequest)) {
@@ -1028,26 +1125,127 @@ void helix_frame_export_cleanup(HelixFrameExport *fe)
 static void *vsock_accept_thread(void *arg);
 
 /*
+ * Read exactly n bytes from socket
+ */
+static bool read_exact_bytes(int fd, void *buf, size_t n)
+{
+    size_t total = 0;
+    while (total < n) {
+        ssize_t r = recv(fd, (uint8_t *)buf + total, n - total, 0);
+        if (r <= 0) {
+            if (r < 0 && errno == EINTR) continue;
+            return false;
+        }
+        total += r;
+    }
+    return true;
+}
+
+/*
  * vsock server thread - listens for connections and processes messages
+ *
+ * Uses a message-framing protocol: read header first to determine message
+ * size, then read remaining payload. This supports large payloads (pixel data).
  */
 static void *vsock_server_thread(void *arg)
 {
     HelixFrameExport *fe = (HelixFrameExport *)arg;
-    uint8_t buffer[65536];
 
     while (1) {
-        ssize_t received = recv(fe->vsock_fd, buffer, sizeof(buffer), 0);
-        if (received <= 0) {
-            if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                /* SO_RCVTIMEO fired - connection idle for 30s, treat as dead */
+        /* Step 1: Read message header */
+        HelixMsgHeader header;
+        if (!read_exact_bytes(fe->vsock_fd, &header, sizeof(header))) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 error_report("[HELIX] Client recv timeout (30s idle), disconnecting");
-            } else if (received < 0 && errno != EINTR) {
+            } else if (errno != EINTR) {
                 error_report("[HELIX] vsock recv error: %s", strerror(errno));
             }
             break;
         }
 
-        int ret = helix_frame_export_process_msg(fe, buffer, received);
+        if (header.magic != HELIX_MSG_MAGIC) {
+            error_report("[HELIX] Invalid message magic: 0x%08x", header.magic);
+            break;
+        }
+
+        /* Step 2: Read the rest of the fixed-size message based on type */
+        int ret = HELIX_ERR_OK;
+
+        if (header.msg_type == HELIX_MSG_FRAME_REQUEST) {
+            /* Read remaining HelixFrameRequest fields */
+            HelixFrameRequest req;
+            memcpy(&req.header, &header, sizeof(header));
+            size_t remaining = sizeof(HelixFrameRequest) - sizeof(HelixMsgHeader);
+            if (!read_exact_bytes(fe->vsock_fd, ((uint8_t *)&req) + sizeof(HelixMsgHeader),
+                                  remaining)) {
+                error_report("[HELIX] Failed to read frame request body");
+                break;
+            }
+
+            /* Step 3: If HELIX_FLAG_PIXEL_DATA, read pixel data from socket */
+            uint8_t *pixel_data = NULL;
+            size_t pixel_data_size = 0;
+
+            if (header.flags & HELIX_FLAG_PIXEL_DATA) {
+                pixel_data_size = header.payload_size -
+                                  (sizeof(HelixFrameRequest) - sizeof(HelixMsgHeader));
+                if (pixel_data_size > 0 && pixel_data_size <= 64 * 1024 * 1024) {
+                    pixel_data = malloc(pixel_data_size);
+                    if (!pixel_data) {
+                        error_report("[HELIX] Failed to allocate %zu bytes for pixel data",
+                                     pixel_data_size);
+                        break;
+                    }
+                    if (!read_exact_bytes(fe->vsock_fd, pixel_data, pixel_data_size)) {
+                        error_report("[HELIX] Failed to read pixel data (%zu bytes)",
+                                     pixel_data_size);
+                        free(pixel_data);
+                        break;
+                    }
+                    helix_log("[HELIX] Received %zu bytes of pixel data", pixel_data_size);
+                }
+            }
+
+            ret = handle_frame_request(fe, &req, pixel_data, pixel_data_size);
+            free(pixel_data);
+
+        } else if (header.msg_type == HELIX_MSG_CONFIG_REQ) {
+            HelixConfigRequest config_req;
+            memcpy(&config_req.header, &header, sizeof(header));
+            size_t remaining = sizeof(HelixConfigRequest) - sizeof(HelixMsgHeader);
+            if (!read_exact_bytes(fe->vsock_fd,
+                                  ((uint8_t *)&config_req) + sizeof(HelixMsgHeader),
+                                  remaining)) {
+                error_report("[HELIX] Failed to read config request body");
+                break;
+            }
+            ret = handle_config_request(fe, &config_req);
+
+        } else if (header.msg_type == HELIX_MSG_PING) {
+            HelixMsgHeader pong = {
+                .magic = HELIX_MSG_MAGIC,
+                .msg_type = HELIX_MSG_PONG,
+                .flags = 0,
+                .session_id = header.session_id,
+                .payload_size = 0
+            };
+            send(fe->vsock_fd, &pong, sizeof(pong), 0);
+            continue;
+
+        } else {
+            error_report("[HELIX] Unknown message type: %d", header.msg_type);
+            /* Skip any payload */
+            if (header.payload_size > 0) {
+                uint8_t *skip = malloc(header.payload_size);
+                if (skip) {
+                    read_exact_bytes(fe->vsock_fd, skip, header.payload_size);
+                    free(skip);
+                }
+            }
+            continue;
+        }
+
+        int ret_unused = ret; (void)ret_unused;
         if (ret != HELIX_ERR_OK) {
             /* Send error response */
             HelixErrorResponse err = {

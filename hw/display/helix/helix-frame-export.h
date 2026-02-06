@@ -35,6 +35,9 @@
 #define HELIX_MSG_PONG            0x11  /* Keepalive response */
 #define HELIX_MSG_ERROR           0xFF  /* Error response */
 
+/* Frame request flags */
+#define HELIX_FLAG_PIXEL_DATA     0x01  /* Raw pixel data follows the frame request */
+
 /* Pixel formats (matching DRM/GBM formats) */
 #define HELIX_FORMAT_BGRA8888     0x34325241  /* DRM_FORMAT_ARGB8888 */
 #define HELIX_FORMAT_RGBA8888     0x34324241  /* DRM_FORMAT_ABGR8888 */
