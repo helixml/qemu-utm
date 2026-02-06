@@ -48,6 +48,48 @@ uint32_t virtio_gpu_get_scanout_resource_id(void *virtio_gpu, uint32_t scanout_i
 
     return g->parent_obj.scanout[scanout_idx].resource_id;
 }
+
+/*
+ * Helper function to get DisplaySurface pixel data safely
+ * Returns true if successful, filling in width, height, stride, and data pointer
+ * This avoids exposing DisplaySurface struct to helix-frame-export.m
+ */
+bool virtio_gpu_get_scanout_surface_data(void *virtio_gpu,
+                                          uint32_t scanout_idx,
+                                          uint32_t *width,
+                                          uint32_t *height,
+                                          uint32_t *stride,
+                                          void **data)
+{
+    VirtIOGPU *g = (VirtIOGPU *)virtio_gpu;
+
+    if (scanout_idx >= VIRTIO_GPU_MAX_SCANOUTS) {
+        error_report("[HELIX] Invalid scanout_idx %u >= %d", scanout_idx, VIRTIO_GPU_MAX_SCANOUTS);
+        return false;
+    }
+
+    struct virtio_gpu_scanout *scanout = &g->parent_obj.scanout[scanout_idx];
+    DisplaySurface *ds = scanout->ds;
+
+    if (!ds) {
+        error_report("[HELIX] No DisplaySurface for scanout %u", scanout_idx);
+        return false;
+    }
+
+    *width = surface_width(ds);
+    *height = surface_height(ds);
+    *stride = surface_stride(ds);
+    *data = surface_data(ds);
+
+    if (!*data || *width == 0 || *height == 0) {
+        error_report("[HELIX] Invalid DisplaySurface data: %p, %ux%u", *data, *width, *height);
+        return false;
+    }
+
+    error_report("[HELIX] DisplaySurface data retrieved: %ux%u, stride=%u, data=%p",
+                 *width, *height, *stride, *data);
+    return true;
+}
 #endif
 
 #define NATIVE_HANDLE_SUPPORT_VERSION (1)

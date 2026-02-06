@@ -176,6 +176,17 @@ IOSurfaceRef helix_get_iosurface_from_scanout(void *virtio_gpu,
                                                 uint32_t scanout_id);
 
 /*
+ * Get DisplaySurface pixel data (implemented in virtio-gpu-virgl.c)
+ * Returns true if successful, false if DisplaySurface not available
+ */
+bool virtio_gpu_get_scanout_surface_data(void *virtio_gpu,
+                                          uint32_t scanout_idx,
+                                          uint32_t *width,
+                                          uint32_t *height,
+                                          uint32_t *stride,
+                                          void **data);
+
+/*
  * Encode an IOSurface frame
  */
 int helix_encode_iosurface(HelixFrameExport *fe,

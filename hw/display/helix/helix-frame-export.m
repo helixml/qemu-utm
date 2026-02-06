@@ -626,51 +626,28 @@ IOSurfaceRef helix_get_iosurface_for_resource(void *virtio_gpu,
 IOSurfaceRef helix_get_iosurface_from_scanout(void *virtio_gpu,
                                                 uint32_t scanout_id)
 {
-    /* Include virtio-gpu header to access scanout structure */
-    VirtIOGPU *g = (VirtIOGPU *)virtio_gpu;
-
     helix_log("[HELIX] helix_get_iosurface_from_scanout called: scanout_id=%u", scanout_id);
 
-    if (!g) {
+    if (!virtio_gpu) {
         helix_log("[HELIX] ERROR: virtio_gpu pointer is NULL");
         return NULL;
     }
 
-    if (scanout_id >= VIRTIO_GPU_MAX_SCANOUTS) {
-        helix_log("[HELIX] Invalid scanout_id %u", scanout_id);
+    /* Use safe helper function from virtio-gpu-virgl.c to get DisplaySurface data
+     * This avoids accessing DisplaySurface struct directly and prevents crashes */
+    uint32_t width = 0, height = 0, stride = 0;
+    void *data = NULL;
+
+    bool success = virtio_gpu_get_scanout_surface_data(
+        virtio_gpu, scanout_id, &width, &height, &stride, &data);
+
+    if (!success) {
+        helix_log("[HELIX] Failed to get DisplaySurface data for scanout %u", scanout_id);
+        helix_log("[HELIX] DisplaySurface may not be initialized yet (no SET_SCANOUT_BLOB command)");
         return NULL;
     }
 
-    struct virtio_gpu_scanout *scanout = &g->parent_obj.scanout[scanout_id];
-    helix_log("[HELIX] Got scanout pointer: %p", scanout);
-
-    DisplaySurface *ds = scanout->ds;
-    helix_log("[HELIX] DisplaySurface pointer: %p", ds);
-
-    if (!ds) {
-        helix_log("[HELIX] No DisplaySurface for scanout %u - not initialized yet", scanout_id);
-        helix_log("[HELIX] DisplaySurface must be created by SET_SCANOUT command first");
-        return NULL;
-    }
-
-    helix_log("[HELIX] DisplaySurface is valid, checking image pointer");
-    if (!ds->image) {
-        helix_log("[HELIX] ERROR: DisplaySurface->image is NULL");
-        return NULL;
-    }
-    helix_log("[HELIX] DisplaySurface->image is valid: %p", ds->image);
-
-    uint32_t width = surface_width(ds);
-    uint32_t height = surface_height(ds);
-    uint32_t stride = surface_stride(ds);
-    void *data = surface_data(ds);
-
-    if (!data || width == 0 || height == 0) {
-        helix_log("[HELIX] Invalid DisplaySurface dimensions: %ux%u", width, height);
-        return NULL;
-    }
-
-    helix_log("[HELIX] Reading from DisplaySurface: %ux%u, stride=%u", width, height, stride);
+    helix_log("[HELIX] DisplaySurface data retrieved: %ux%u, stride=%u", width, height, stride);
 
     /* Calculate expected size */
     size_t bytes_per_pixel = 4;  /* BGRA8888 */
