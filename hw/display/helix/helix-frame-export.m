@@ -182,10 +182,70 @@ static void encoder_output_callback(void *outputCallbackRefCon,
         }
     }
 
+    /*
+     * For keyframes, extract SPS/PPS from the format description.
+     * VideoToolbox stores these in CMFormatDescription, NOT in the data buffer.
+     * h264parse needs SPS/PPS before it can process any slice data.
+     */
+    uint8_t *sps_pps_data = NULL;
+    size_t sps_pps_size = 0;
+
+    if (is_keyframe) {
+        CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(sampleBuffer);
+        if (fmt) {
+            size_t paramCount = 0;
+            int nalUnitHeaderLen = 0;
+            OSStatus fmtErr = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                fmt, 0, NULL, NULL, &paramCount, &nalUnitHeaderLen);
+
+            if (fmtErr == noErr && paramCount > 0) {
+                /* First pass: calculate total size needed */
+                size_t total_param_size = 0;
+                for (size_t i = 0; i < paramCount; i++) {
+                    const uint8_t *paramData = NULL;
+                    size_t paramSize = 0;
+                    fmtErr = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                        fmt, i, &paramData, &paramSize, NULL, NULL);
+                    if (fmtErr == noErr) {
+                        total_param_size += 4 + paramSize; /* 4-byte start code + NAL data */
+                    }
+                }
+
+                /* Allocate and fill SPS/PPS buffer */
+                sps_pps_data = malloc(total_param_size);
+                if (sps_pps_data) {
+                    size_t offset = 0;
+                    for (size_t i = 0; i < paramCount; i++) {
+                        const uint8_t *paramData = NULL;
+                        size_t paramSize = 0;
+                        fmtErr = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                            fmt, i, &paramData, &paramSize, NULL, NULL);
+                        if (fmtErr == noErr && paramData) {
+                            /* Write Annex B start code */
+                            sps_pps_data[offset++] = 0x00;
+                            sps_pps_data[offset++] = 0x00;
+                            sps_pps_data[offset++] = 0x00;
+                            sps_pps_data[offset++] = 0x01;
+                            /* Copy parameter set data */
+                            memcpy(sps_pps_data + offset, paramData, paramSize);
+                            offset += paramSize;
+                            helix_log("[HELIX] Parameter set %zu: %zu bytes (NAL type %d)",
+                                      i, paramSize, paramData[0] & 0x1F);
+                        }
+                    }
+                    sps_pps_size = offset;
+                    helix_log("[HELIX] Extracted %zu parameter sets, total %zu bytes",
+                              paramCount, sps_pps_size);
+                }
+            }
+        }
+    }
+
     /* Get the data buffer */
     CMBlockBufferRef dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer);
     if (!dataBuffer) {
         error_report("No data buffer in sample\n");
+        free(sps_pps_data);
         return;
     }
 
@@ -195,22 +255,34 @@ static void encoder_output_callback(void *outputCallbackRefCon,
                                                 &totalLength, &dataPtr);
     if (err != noErr || !dataPtr) {
         error_report("Failed to get data pointer: %d\n", (int)err);
+        free(sps_pps_data);
         return;
     }
 
     /* VideoToolbox outputs H.264 in avcc format (4-byte length prefixes).
-     * Convert to Annex B (start codes 0x00000001) for vsockenc. */
-    size_t annexb_size = totalLength; /* Start codes are same size as length prefixes */
+     * Convert to Annex B (start codes 0x00000001) for vsockenc.
+     * For keyframes, prepend SPS/PPS extracted from format description. */
+    size_t annexb_size = sps_pps_size + totalLength;
     uint8_t *annexb_data = malloc(annexb_size);
     if (!annexb_data) {
         error_report("Failed to allocate annexb buffer\n");
+        free(sps_pps_data);
         pthread_mutex_unlock(&fe->mutex);
         return;
     }
 
-    helix_log("[HELIX] Converting avcc to Annex B: input_size=%zu", totalLength);
+    helix_log("[HELIX] Converting avcc to Annex B: input_size=%zu, sps_pps_size=%zu",
+              totalLength, sps_pps_size);
     size_t src_offset = 0;
     size_t dst_offset = 0;
+
+    /* Prepend SPS/PPS for keyframes */
+    if (sps_pps_data && sps_pps_size > 0) {
+        memcpy(annexb_data, sps_pps_data, sps_pps_size);
+        dst_offset = sps_pps_size;
+        free(sps_pps_data);
+        sps_pps_data = NULL;
+    }
     uint32_t nal_count_actual = 0;
     while (src_offset < totalLength) {
         /* Read 4-byte NAL length (big-endian) */
