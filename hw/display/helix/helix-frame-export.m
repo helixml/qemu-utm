@@ -966,8 +966,11 @@ static void *vsock_server_thread(void *arg)
     while (1) {
         ssize_t received = recv(fe->vsock_fd, buffer, sizeof(buffer), 0);
         if (received <= 0) {
-            if (received < 0 && errno != EINTR) {
-                error_report("vsock recv error: %s\n", strerror(errno));
+            if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                /* SO_RCVTIMEO fired - connection idle for 30s, treat as dead */
+                error_report("[HELIX] Client recv timeout (30s idle), disconnecting");
+            } else if (received < 0 && errno != EINTR) {
+                error_report("[HELIX] vsock recv error: %s", strerror(errno));
             }
             break;
         }
@@ -1050,7 +1053,7 @@ int helix_frame_export_init(void *virtio_gpu, int vsock_port)
         return -1;
     }
 
-    if (listen(listen_fd, 1) < 0) {
+    if (listen(listen_fd, 5) < 0) {
         error_report("Failed to listen on TCP socket: %s\n", strerror(errno));
         close(listen_fd);
         free(fe);
@@ -1097,6 +1100,16 @@ static void *vsock_accept_thread(void *arg)
         }
 
         error_report("[HELIX] Guest connected!");
+
+        /* Enable TCP keepalive to detect dead connections */
+        int keepalive = 1;
+        setsockopt(client_fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+
+        /* Set receive timeout (30s) so recv() doesn't block forever on dead connections */
+        struct timeval tv;
+        tv.tv_sec = 30;
+        tv.tv_usec = 0;
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
         /* Update vsock_fd to client connection */
         fe->vsock_fd = client_fd;
