@@ -850,10 +850,180 @@ int helix_encode_iosurface(HelixFrameExport *fe,
 }
 
 /*
+ * Create NV12 bi-planar IOSurface from raw pixel data.
+ *
+ * NV12 layout: Y plane (full resolution) + UV plane (half resolution, interleaved).
+ * Total size = width * height * 1.5
+ *
+ * VideoToolbox natively encodes from NV12 ('420v'), so this avoids the
+ * internal BGRA→NV12 colorspace conversion that happens with BGRA input.
+ */
+static IOSurfaceRef helix_create_nv12_iosurface(const uint8_t *pixel_data,
+                                                  size_t pixel_data_size,
+                                                  uint32_t width,
+                                                  uint32_t height)
+{
+    uint32_t y_stride = width;
+    uint32_t uv_stride = width;  /* NV12: interleaved CbCr, half width but 2 bytes per pair */
+    uint32_t uv_height = height / 2;
+    size_t y_size = (size_t)y_stride * height;
+    size_t uv_size = (size_t)uv_stride * uv_height;
+    size_t total_size = y_size + uv_size;
+
+    if (pixel_data_size < total_size) {
+        helix_log("[HELIX] NV12 pixel data too small: got %zu, expected %zu (%ux%u)",
+                  pixel_data_size, total_size, width, height);
+        return NULL;
+    }
+
+    /* Create bi-planar IOSurface with NV12 format */
+    CFMutableDictionaryRef props = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 0,
+        &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks);
+
+    int w = (int)width, h = (int)height;
+    uint32_t pixel_format = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    int plane_count = 2;
+
+    CFNumberRef widthNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &w);
+    CFNumberRef heightNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &h);
+    CFNumberRef pixelFormatNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &pixel_format);
+    CFNumberRef planeCountNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &plane_count);
+
+    CFDictionarySetValue(props, kIOSurfaceWidth, widthNum);
+    CFDictionarySetValue(props, kIOSurfaceHeight, heightNum);
+    CFDictionarySetValue(props, kIOSurfacePixelFormat, pixelFormatNum);
+
+    /* Plane info array */
+    CFMutableArrayRef planeArray = CFArrayCreateMutable(
+        kCFAllocatorDefault, 2, &kCFTypeArrayCallBacks);
+
+    /* Plane 0: Y (luma) - full resolution, 1 byte per element */
+    {
+        CFMutableDictionaryRef plane = CFDictionaryCreateMutable(
+            kCFAllocatorDefault, 0,
+            &kCFTypeDictionaryKeyCallBacks,
+            &kCFTypeDictionaryValueCallBacks);
+
+        int pw = w, ph = h, pbpr = (int)y_stride, pbpe = 1;
+        size_t ps = y_size;
+        CFNumberRef pWidth = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &pw);
+        CFNumberRef pHeight = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &ph);
+        CFNumberRef pBPR = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &pbpr);
+        CFNumberRef pBPE = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &pbpe);
+        CFNumberRef pSize = CFNumberCreate(kCFAllocatorDefault, kCFNumberLongType, &ps);
+
+        CFDictionarySetValue(plane, kIOSurfacePlaneWidth, pWidth);
+        CFDictionarySetValue(plane, kIOSurfacePlaneHeight, pHeight);
+        CFDictionarySetValue(plane, kIOSurfacePlaneBytesPerRow, pBPR);
+        CFDictionarySetValue(plane, kIOSurfacePlaneBytesPerElement, pBPE);
+        CFDictionarySetValue(plane, kIOSurfacePlaneSize, pSize);
+
+        CFRelease(pWidth);
+        CFRelease(pHeight);
+        CFRelease(pBPR);
+        CFRelease(pBPE);
+        CFRelease(pSize);
+
+        CFArrayAppendValue(planeArray, plane);
+        CFRelease(plane);
+    }
+
+    /* Plane 1: UV (chroma) - half resolution, 2 bytes per element (interleaved CbCr) */
+    {
+        CFMutableDictionaryRef plane = CFDictionaryCreateMutable(
+            kCFAllocatorDefault, 0,
+            &kCFTypeDictionaryKeyCallBacks,
+            &kCFTypeDictionaryValueCallBacks);
+
+        int pw = w / 2, ph = (int)uv_height, pbpr = (int)uv_stride, pbpe = 2;
+        size_t ps = uv_size;
+        CFNumberRef pWidth = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &pw);
+        CFNumberRef pHeight = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &ph);
+        CFNumberRef pBPR = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &pbpr);
+        CFNumberRef pBPE = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &pbpe);
+        CFNumberRef pSize = CFNumberCreate(kCFAllocatorDefault, kCFNumberLongType, &ps);
+
+        CFDictionarySetValue(plane, kIOSurfacePlaneWidth, pWidth);
+        CFDictionarySetValue(plane, kIOSurfacePlaneHeight, pHeight);
+        CFDictionarySetValue(plane, kIOSurfacePlaneBytesPerRow, pBPR);
+        CFDictionarySetValue(plane, kIOSurfacePlaneBytesPerElement, pBPE);
+        CFDictionarySetValue(plane, kIOSurfacePlaneSize, pSize);
+
+        CFRelease(pWidth);
+        CFRelease(pHeight);
+        CFRelease(pBPR);
+        CFRelease(pBPE);
+        CFRelease(pSize);
+
+        CFArrayAppendValue(planeArray, plane);
+        CFRelease(plane);
+    }
+
+    CFDictionarySetValue(props, kIOSurfacePlaneInfo, planeArray);
+
+    CFRelease(widthNum);
+    CFRelease(heightNum);
+    CFRelease(pixelFormatNum);
+    CFRelease(planeCountNum);
+    CFRelease(planeArray);
+
+    IOSurfaceRef surface = IOSurfaceCreate(props);
+    CFRelease(props);
+
+    if (!surface) {
+        helix_log("[HELIX] Failed to create NV12 IOSurface");
+        return NULL;
+    }
+
+    /* Copy Y and UV planes into the IOSurface */
+    IOSurfaceLock(surface, 0, NULL);
+
+    void *y_base = IOSurfaceGetBaseAddressOfPlane(surface, 0);
+    size_t y_dest_stride = IOSurfaceGetBytesPerRowOfPlane(surface, 0);
+
+    void *uv_base = IOSurfaceGetBaseAddressOfPlane(surface, 1);
+    size_t uv_dest_stride = IOSurfaceGetBytesPerRowOfPlane(surface, 1);
+
+    /* Copy Y plane */
+    if (y_dest_stride == y_stride) {
+        memcpy(y_base, pixel_data, y_size);
+    } else {
+        for (uint32_t row = 0; row < height; row++) {
+            memcpy((uint8_t *)y_base + row * y_dest_stride,
+                   pixel_data + row * y_stride,
+                   y_stride);
+        }
+    }
+
+    /* Copy UV plane */
+    const uint8_t *uv_src = pixel_data + y_size;
+    if (uv_dest_stride == uv_stride) {
+        memcpy(uv_base, uv_src, uv_size);
+    } else {
+        for (uint32_t row = 0; row < uv_height; row++) {
+            memcpy((uint8_t *)uv_base + row * uv_dest_stride,
+                   uv_src + row * uv_stride,
+                   uv_stride);
+        }
+    }
+
+    IOSurfaceUnlock(surface, 0, NULL);
+
+    helix_log("[HELIX] Created NV12 IOSurface %p (%ux%u) from %zu bytes (Y=%zu + UV=%zu)",
+              surface, width, height, pixel_data_size, y_size, uv_size);
+
+    return surface;
+}
+
+/*
  * Create IOSurface from raw pixel data received over the network.
  * This is used when the guest sends SHM pixel data (resource_id=0)
  * because the host can't read container-internal screen data from
  * the VM's GPU resources or DisplaySurface.
+ *
+ * Supports BGRA (single-plane) and NV12 (bi-planar) formats.
  */
 static IOSurfaceRef helix_create_iosurface_from_pixels(const uint8_t *pixel_data,
                                                          size_t pixel_data_size,
@@ -867,7 +1037,12 @@ static IOSurfaceRef helix_create_iosurface_from_pixels(const uint8_t *pixel_data
         return NULL;
     }
 
-    /* Determine pixel format for IOSurface */
+    /* NV12 bi-planar path */
+    if (format == HELIX_FORMAT_NV12) {
+        return helix_create_nv12_iosurface(pixel_data, pixel_data_size, width, height);
+    }
+
+    /* BGRA/RGBA single-plane path */
     uint32_t pixel_format = kCVPixelFormatType_32BGRA;  /* default */
     size_t bytes_per_pixel = 4;
     if (format == HELIX_FORMAT_RGBA8888) {
