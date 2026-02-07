@@ -33,6 +33,9 @@
 #define HELIX_MSG_CONFIG_RESP     0x05  /* Host -> Guest: encoder config ack */
 #define HELIX_MSG_PING            0x10  /* Keepalive */
 #define HELIX_MSG_PONG            0x11  /* Keepalive response */
+#define HELIX_MSG_ENABLE_SCANOUT  0x20  /* Guest -> Host: connect DRM connector */
+#define HELIX_MSG_DISABLE_SCANOUT 0x21  /* Guest -> Host: disconnect DRM connector */
+#define HELIX_MSG_SCANOUT_RESP    0x22  /* Host -> Guest: scanout enable/disable result */
 #define HELIX_MSG_ERROR           0xFF  /* Error response */
 
 /* Frame request flags */
