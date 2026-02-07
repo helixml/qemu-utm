@@ -87,7 +87,7 @@ bool virtio_gpu_get_scanout_surface_data(void *virtio_gpu,
     DisplaySurface *ds = scanout->ds;
 
     if (!ds) {
-        error_report("[HELIX] No DisplaySurface for scanout %u", scanout_idx);
+        helix_debug_log("[GET_DS] No DisplaySurface for scanout %u", scanout_idx);
         return false;
     }
 
@@ -593,16 +593,10 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
     }
     g->parent_obj.scanout[ss.scanout_id].resource_id = ss.resource_id;
 
-    error_report("[HELIX] virgl_cmd_set_scanout completed: scanout=%u, resource=%u",
-                 ss.scanout_id, ss.resource_id);
+    helix_debug_log("[SET_SCANOUT_DONE] scanout=%u resource=%u", ss.scanout_id, ss.resource_id);
 
 #ifdef __APPLE__
-    /* Update DisplaySurface copy for Helix frame export (eliminates race condition) */
-    error_report("[HELIX] Calling helix_update_scanout_displaysurface...");
     helix_update_scanout_displaysurface(g, ss.scanout_id, ss.resource_id);
-    error_report("[HELIX] helix_update_scanout_displaysurface returned");
-#else
-    error_report("[HELIX] WARNING: __APPLE__ not defined, skipping DisplaySurface creation");
 #endif
 }
 
@@ -616,11 +610,10 @@ static void helix_update_scanout_displaysurface(VirtIOGPU *g,
                                                  uint32_t scanout_id,
                                                  uint32_t resource_id)
 {
-    error_report("[HELIX-v3] helix_update_scanout_displaysurface called: scanout=%u, resource=%u",
-                 scanout_id, resource_id);
+    helix_debug_log("[UPDATE_DS] scanout=%u resource=%u", scanout_id, resource_id);
 
     if (scanout_id >= g->parent_obj.conf.max_outputs) {
-        error_report("[HELIX] Invalid scanout_id %u >= max_outputs %u",
+        helix_debug_log("[UPDATE_DS] ERROR: scanout_id %u >= max_outputs %u",
                      scanout_id, g->parent_obj.conf.max_outputs);
         return;
     }
@@ -628,8 +621,7 @@ static void helix_update_scanout_displaysurface(VirtIOGPU *g,
     struct virtio_gpu_scanout *scanout = &g->parent_obj.scanout[scanout_id];
 
     if (resource_id == 0) {
-        /* Scanout disabled */
-        error_report("[HELIX] Scanout disabled, freeing DisplaySurface if exists");
+        helix_debug_log("[UPDATE_DS] Scanout %u disabled", scanout_id);
         if (scanout->ds) {
             qemu_free_displaysurface(scanout->ds);
             scanout->ds = NULL;
@@ -641,7 +633,7 @@ static void helix_update_scanout_displaysurface(VirtIOGPU *g,
     struct virgl_renderer_resource_info_ext info_ext = {0};
     int ret = virgl_renderer_resource_get_info_ext(resource_id, &info_ext);
     if (ret != 0) {
-        error_report("[HELIX] virgl_renderer_resource_get_info_ext failed for resource %u: ret=%d",
+        helix_debug_log("[UPDATE_DS] ERROR: get_info_ext failed for resource %u: ret=%d",
                      resource_id, ret);
         return;
     }
@@ -669,7 +661,7 @@ static void helix_update_scanout_displaysurface(VirtIOGPU *g,
             return;
         }
 
-        error_report("[HELIX] Created DisplaySurface %ux%u for scanout %u",
+        helix_debug_log("[UPDATE_DS] Created DisplaySurface %ux%u for scanout %u",
                      width, height, scanout_id);
     }
 
@@ -731,13 +723,13 @@ static void helix_update_scanout_displaysurface(VirtIOGPU *g,
             }
         }
 
-        error_report("[HELIX] Updated DisplaySurface for scanout %u from resource %u (%ux%u)",
+        helix_debug_log("[UPDATE_DS] OK: scanout %u resource %u (%ux%u) -> frame_ready",
                      scanout_id, resource_id, width, height);
 
         /* Trigger auto-encoding for subscribed clients */
         helix_scanout_frame_ready(g, scanout_id, resource_id);
     } else {
-        error_report("[HELIX] virgl_renderer_transfer_read_iov failed: ret=%d", ret);
+        helix_debug_log("[UPDATE_DS] ERROR: transfer_read_iov failed: ret=%d", ret);
     }
 
     free(pixel_data);
@@ -1225,12 +1217,9 @@ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
 
     virtio_gpu_update_scanout(g, ss.scanout_id, &res->base, &fb, &ss.r);
 
-    error_report("[HELIX] virgl_cmd_set_scanout_blob completed: scanout=%u, resource=%u",
-                 ss.scanout_id, ss.resource_id);
+    helix_debug_log("[SET_SCANOUT_BLOB_DONE] scanout=%u resource=%u", ss.scanout_id, ss.resource_id);
 #ifdef __APPLE__
-    error_report("[HELIX] Calling helix_update_scanout_displaysurface from set_scanout_blob...");
     helix_update_scanout_displaysurface(g, ss.scanout_id, ss.resource_id);
-    error_report("[HELIX] helix_update_scanout_displaysurface returned successfully");
 #endif
 }
 #endif

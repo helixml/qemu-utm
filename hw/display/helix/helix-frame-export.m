@@ -1835,27 +1835,55 @@ static int create_scanout_encoder(HelixFrameExport *fe, uint32_t scanout_id,
 void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
                                 uint32_t resource_id)
 {
+    static uint64_t entry_count = 0;
+    entry_count++;
     HelixFrameExport *fe = g_helix_export;
-    if (!fe || !fe->valid || scanout_id >= HELIX_MAX_SCANOUTS) return;
-    if (scanout_id == 0) return;  /* Don't auto-encode VM console */
+    if (!fe || !fe->valid || scanout_id >= HELIX_MAX_SCANOUTS) {
+        if (entry_count <= 5 || (entry_count % 1000) == 0) {
+            helix_log("[FRAME_READY_ENTRY] #%llu scanout=%u fe=%p valid=%d EARLY_RETURN",
+                      entry_count, scanout_id, (void *)fe, fe ? fe->valid : -1);
+        }
+        return;
+    }
 
     /* Check if anyone is subscribed to this scanout */
     bool has_subscriber = false;
+    int active_clients = 0;
     pthread_mutex_lock(&fe->clients_lock);
     for (int i = 0; i < HELIX_MAX_CLIENTS; i++) {
-        if (fe->clients[i].active && fe->clients[i].subscribed &&
-            fe->clients[i].subscribed_scanout == scanout_id) {
-            has_subscriber = true;
-            break;
+        if (fe->clients[i].active) {
+            active_clients++;
+            if (fe->clients[i].subscribed &&
+                fe->clients[i].subscribed_scanout == scanout_id) {
+                has_subscriber = true;
+            }
         }
     }
     pthread_mutex_unlock(&fe->clients_lock);
 
-    if (!has_subscriber) return;
+    if (!has_subscriber) {
+        if (entry_count <= 5 || (entry_count % 1000) == 0) {
+            helix_log("[FRAME_READY_ENTRY] #%llu scanout=%u active_clients=%d NO_SUBSCRIBER",
+                      entry_count, scanout_id, active_clients);
+        }
+        return;
+    }
+
+    static uint64_t ready_count = 0;
+    ready_count++;
+    if (ready_count <= 5 || (ready_count % 100) == 0) {
+        helix_log("[FRAME_READY] #%llu scanout=%u resource=%u has_subscriber=YES",
+                  ready_count, scanout_id, resource_id);
+    }
 
     /* Get DisplaySurface data */
     IOSurfaceRef surface = helix_get_iosurface_from_scanout(virtio_gpu, scanout_id);
-    if (!surface) return;
+    if (!surface) {
+        if (ready_count <= 5 || (ready_count % 100) == 0) {
+            helix_log("[FRAME_READY] No IOSurface for scanout %u", scanout_id);
+        }
+        return;
+    }
 
     /* Get dimensions from surface */
     uint32_t width = (uint32_t)IOSurfaceGetWidth(surface);
@@ -1904,9 +1932,14 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
     }
 
     /* Encode */
-    VTCompressionSessionEncodeFrame(
+    OSStatus encStatus = VTCompressionSessionEncodeFrame(
         enc->session, pixelBuffer, cmPts, cmDuration,
         frameProps, (void *)pts, NULL);
+
+    if (enc->frame_count <= 5 || (enc->frame_count % 100) == 0) {
+        helix_log("[ENCODE] scanout=%u frame=%lld status=%d %ux%u",
+                  scanout_id, enc->frame_count, (int)encStatus, width, height);
+    }
 
     if (frameProps) CFRelease(frameProps);
     CVPixelBufferRelease(pixelBuffer);
@@ -2170,11 +2203,18 @@ static void *multi_accept_thread(void *arg)
  */
 int helix_frame_export_init(void *virtio_gpu, int vsock_port)
 {
-    error_report("========================================");
-    error_report("[HELIX] VERSION: 2026-02-07-v6-multi-scanout");
-    error_report("[HELIX] BUILD: Multi-client, per-scanout auto-encode");
-    error_report("========================================");
-    error_report("[HELIX] Initializing frame export on vsock port %d", vsock_port);
+    helix_log("========================================");
+    helix_log("[HELIX] VERSION: 2026-02-07-v6-multi-scanout");
+    helix_log("[HELIX] BUILD: Multi-client, per-scanout auto-encode");
+    helix_log("========================================");
+    helix_log("[HELIX] Initializing frame export on vsock port %d", vsock_port);
+
+    /* If already initialized (e.g. guest reboot), just update virtio_gpu pointer */
+    if (g_helix_export && g_helix_export->valid) {
+        helix_log("[HELIX] Already initialized, updating virtio_gpu pointer");
+        g_helix_export->virtio_gpu = virtio_gpu;
+        return 0;
+    }
 
     HelixFrameExport *fe = calloc(1, sizeof(HelixFrameExport));
     if (!fe) {
