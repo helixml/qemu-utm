@@ -80,7 +80,7 @@ static void virtio_gpu_text_update(void *opaque, console_ch_t *chardata)
 {
 }
 
-static void virtio_gpu_notify_event(VirtIOGPUBase *g, uint32_t event_type)
+void virtio_gpu_notify_event(VirtIOGPUBase *g, uint32_t event_type)
 {
     g->virtio_config.events_read |= event_type;
     virtio_notify_config(&g->parent_obj);

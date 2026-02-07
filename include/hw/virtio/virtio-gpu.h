@@ -299,6 +299,7 @@ bool virtio_gpu_base_device_realize(DeviceState *qdev,
                                     Error **errp);
 void virtio_gpu_base_device_unrealize(DeviceState *qdev);
 void virtio_gpu_base_reset(VirtIOGPUBase *g);
+void virtio_gpu_notify_event(VirtIOGPUBase *g, uint32_t event_type);
 void virtio_gpu_base_fill_display_info(VirtIOGPUBase *g,
                         struct virtio_gpu_resp_display_info *dpy_info);
 
