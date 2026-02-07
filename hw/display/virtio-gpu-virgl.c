@@ -28,6 +28,21 @@
 
 #ifdef __APPLE__
 #include "helix/helix-frame-export.h"
+#include <stdarg.h>
+
+/* Log to helix debug file (accessible from macOS host) */
+static void helix_debug_log(const char *fmt, ...) {
+    FILE *f = fopen("/Users/luke/Library/Group Containers/"
+                    "WDNLXAD4W8.com.utmapp.UTM/helix-debug.log", "a");
+    if (f) {
+        va_list args;
+        va_start(args, fmt);
+        vfprintf(f, fmt, args);
+        fprintf(f, "\n");
+        va_end(args);
+        fclose(f);
+    }
+}
 
 /* Forward declaration */
 static void helix_update_scanout_displaysurface(VirtIOGPU *g,
@@ -458,6 +473,24 @@ static void virgl_cmd_resource_flush(VirtIOGPU *g,
     trace_virtio_gpu_cmd_res_flush(rf.resource_id,
                                    rf.r.width, rf.r.height, rf.r.x, rf.r.y);
 
+    /* Log resource_flush for debugging scanout capture */
+#ifdef __APPLE__
+    {
+        static uint64_t flush_count = 0;
+        flush_count++;
+        if (flush_count <= 10 || (flush_count % 100) == 0) {
+            helix_debug_log("[FLUSH] #%llu resource_id=%u rect=(%u,%u %ux%u) scanout_map=[",
+                            flush_count, rf.resource_id,
+                            rf.r.x, rf.r.y, rf.r.width, rf.r.height);
+            for (i = 0; i < g->parent_obj.conf.max_outputs && i < 4; i++) {
+                helix_debug_log("  scanout[%d].resource_id=%u",
+                                i, g->parent_obj.scanout[i].resource_id);
+            }
+            helix_debug_log("]");
+        }
+    }
+#endif
+
     for (i = 0; i < g->parent_obj.conf.max_outputs; i++) {
         if (g->parent_obj.scanout[i].resource_id != rf.resource_id) {
             continue;
@@ -466,6 +499,7 @@ static void virgl_cmd_resource_flush(VirtIOGPU *g,
 
 #ifdef __APPLE__
         /* Update DisplaySurface copy for Helix frame export on damage */
+        helix_debug_log("[FLUSH] MATCH: scanout[%d] resource_id=%u -> helix_update", i, rf.resource_id);
         helix_update_scanout_displaysurface(g, i, rf.resource_id);
 #endif
     }
@@ -480,6 +514,12 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
     VIRTIO_GPU_FILL_CMD(ss);
     trace_virtio_gpu_cmd_set_scanout(ss.scanout_id, ss.resource_id,
                                      ss.r.width, ss.r.height, ss.r.x, ss.r.y);
+
+#ifdef __APPLE__
+    helix_debug_log("[SET_SCANOUT] scanout_id=%u resource_id=%u rect=(%u,%u %ux%u)",
+                    ss.scanout_id, ss.resource_id,
+                    ss.r.x, ss.r.y, ss.r.width, ss.r.height);
+#endif
 
     if (ss.scanout_id >= g->parent_obj.conf.max_outputs) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: illegal scanout id specified %d",
@@ -1116,6 +1156,14 @@ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
     trace_virtio_gpu_cmd_set_scanout_blob(ss.scanout_id, ss.resource_id,
                                           ss.r.width, ss.r.height, ss.r.x,
                                           ss.r.y);
+
+#ifdef __APPLE__
+    helix_debug_log("[SET_SCANOUT_BLOB] scanout_id=%u resource_id=%u "
+                    "rect=(%u,%u %ux%u) fb=%ux%u format=%u",
+                    ss.scanout_id, ss.resource_id,
+                    ss.r.x, ss.r.y, ss.r.width, ss.r.height,
+                    ss.width, ss.height, ss.format);
+#endif
 
     if (ss.scanout_id >= g->parent_obj.conf.max_outputs) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: illegal scanout id specified %d",
