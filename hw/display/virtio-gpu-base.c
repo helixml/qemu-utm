@@ -27,7 +27,15 @@ virtio_gpu_base_reset(VirtIOGPUBase *g)
 
     g->enable = 0;
 
+    /* Reset to only scanout 0 enabled (VM console).
+     * Without this, ENABLE_SCANOUT calls persist across guest reboots,
+     * causing drm_fb_helper to try updating 16 virtual consoles at boot
+     * which overwhelms virtio-gpu and makes the VM unresponsive. */
+    g->enabled_output_bitmask = 1;
+
     for (i = 0; i < g->conf.max_outputs; i++) {
+        g->req_state[i].width = (i == 0) ? g->conf.xres : 0;
+        g->req_state[i].height = (i == 0) ? g->conf.yres : 0;
         g->scanout[i].resource_id = 0;
         g->scanout[i].width = 0;
         g->scanout[i].height = 0;
