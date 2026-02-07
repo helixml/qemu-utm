@@ -1454,6 +1454,43 @@ static void *vsock_server_thread(void *arg)
             send(fe->vsock_fd, &pong, sizeof(pong), 0);
             continue;
 
+        } else if (header.msg_type == HELIX_MSG_ENABLE_SCANOUT) {
+            /* Read payload: scanout_id(4) + width(4) + height(4) + refresh(4) */
+            uint32_t payload[4];
+            if (!read_exact_bytes(fe->vsock_fd, payload, 16)) {
+                error_report("[HELIX] Failed to read enable_scanout payload");
+                break;
+            }
+
+            error_report("[HELIX] ENABLE_SCANOUT: id=%u, %ux%u@%u",
+                         payload[0], payload[1], payload[2], payload[3]);
+
+            int result = helix_enable_scanout(fe->virtio_gpu, payload[0],
+                                              payload[1], payload[2]);
+
+            /* Send response */
+            uint8_t resp_buf[sizeof(HelixMsgHeader) + 72];
+            memset(resp_buf, 0, sizeof(resp_buf));
+            HelixMsgHeader *resp_hdr = (HelixMsgHeader *)resp_buf;
+            resp_hdr->magic = HELIX_MSG_MAGIC;
+            resp_hdr->msg_type = HELIX_MSG_SCANOUT_RESP;
+            resp_hdr->session_id = header.session_id;
+            resp_hdr->payload_size = 72;
+            uint32_t *resp_data = (uint32_t *)(resp_buf + sizeof(HelixMsgHeader));
+            resp_data[0] = payload[0];  /* scanout_id */
+            resp_data[1] = (result == 0) ? 1 : 0;  /* success */
+            snprintf((char *)(resp_data + 2), 64, "Virtual-%u", payload[0] + 1);
+            send(fe->vsock_fd, resp_buf, sizeof(resp_buf), 0);
+            continue;
+
+        } else if (header.msg_type == HELIX_MSG_DISABLE_SCANOUT) {
+            uint32_t scanout_id;
+            if (!read_exact_bytes(fe->vsock_fd, &scanout_id, 4)) {
+                break;
+            }
+            helix_disable_scanout(fe->virtio_gpu, scanout_id);
+            continue;
+
         } else {
             error_report("[HELIX] Unknown message type: %d", header.msg_type);
             /* Skip any payload */
