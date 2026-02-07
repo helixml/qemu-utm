@@ -202,18 +202,10 @@ virtio_gpu_base_device_realize(DeviceState *qdev,
         virtio_add_queue(vdev, 16, cursor_cb);
     }
 
-    /* Enable all scanouts so containers can use them.
-     * Scanout 0 uses the configured resolution (VM primary display).
-     * Scanouts 1+ use 1920x1080 as default for container desktops.
-     * Each scanout appears as a "connected" DRM connector in the guest. */
-    g->enabled_output_bitmask = (1 << g->conf.max_outputs) - 1;
+    g->enabled_output_bitmask = 1;
 
     g->req_state[0].width = g->conf.xres;
     g->req_state[0].height = g->conf.yres;
-    for (i = 1; i < g->conf.max_outputs; i++) {
-        g->req_state[i].width = 1920;
-        g->req_state[i].height = 1080;
-    }
 
     g->hw_ops = &virtio_gpu_ops;
     for (i = 0; i < g->conf.max_outputs; i++) {
