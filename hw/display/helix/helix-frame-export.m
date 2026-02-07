@@ -8,7 +8,12 @@
  */
 
 #include "helix-frame-export.h"
-#include "hw/virtio/virtio-gpu.h"
+
+/* Helix scanout helpers - implemented in virtio-gpu-base.c
+ * because we can't include hw/virtio/virtio-gpu.h in Objective-C */
+int helix_enable_scanout(void *virtio_gpu, uint32_t scanout_id,
+                         uint32_t width, uint32_t height);
+int helix_disable_scanout(void *virtio_gpu, uint32_t scanout_id);
 
 #ifdef __APPLE__
 
@@ -1260,7 +1265,7 @@ int helix_frame_export_process_msg(HelixFrameExport *fe,
 
     case HELIX_MSG_ENABLE_SCANOUT:
         {
-            if (len < sizeof(HelixMsgHeader) + 16) {  /* header + scanout_id + w + h + refresh */
+            if (len < sizeof(HelixMsgHeader) + 16) {
                 return HELIX_ERR_INVALID_MSG;
             }
             const uint8_t *payload = data + sizeof(HelixMsgHeader);
@@ -1271,36 +1276,19 @@ int helix_frame_export_process_msg(HelixFrameExport *fe,
             error_report("[HELIX] ENABLE_SCANOUT: id=%u, %ux%u\n",
                          scanout_id, width, height);
 
-            /* Enable the scanout in virtio-gpu */
-            VirtIOGPUBase *g = VIRTIO_GPU_BASE(fe->virtio_gpu);
-            if (scanout_id >= g->conf.max_outputs) {
-                error_report("[HELIX] Invalid scanout_id %u >= %d\n",
-                             scanout_id, g->conf.max_outputs);
-                return HELIX_ERR_INVALID_MSG;
-            }
-
-            /* Set the requested resolution and enable the output */
-            g->req_state[scanout_id].width = width;
-            g->req_state[scanout_id].height = height;
-            g->enabled_output_bitmask |= (1 << scanout_id);
-
-            /* Trigger display hotplug notification to guest */
-            virtio_gpu_notify_event(g, VIRTIO_GPU_EVENT_DISPLAY);
-
-            error_report("[HELIX] Scanout %u enabled: %ux%u\n",
-                         scanout_id, width, height);
+            int ret = helix_enable_scanout(fe->virtio_gpu, scanout_id, width, height);
 
             /* Send response */
             uint8_t resp_buf[sizeof(HelixMsgHeader) + 72];
-            HelixMsgHeader *resp = (HelixMsgHeader *)resp_buf;
-            resp->magic = HELIX_MSG_MAGIC;
-            resp->msg_type = HELIX_MSG_SCANOUT_RESP;
-            resp->flags = 0;
-            resp->session_id = header->session_id;
-            resp->payload_size = 72;  /* scanout_id(4) + success(4) + connector(64) */
+            HelixMsgHeader *resp_hdr = (HelixMsgHeader *)resp_buf;
+            resp_hdr->magic = HELIX_MSG_MAGIC;
+            resp_hdr->msg_type = HELIX_MSG_SCANOUT_RESP;
+            resp_hdr->flags = 0;
+            resp_hdr->session_id = header->session_id;
+            resp_hdr->payload_size = 72;
             uint32_t *resp_payload = (uint32_t *)(resp_buf + sizeof(HelixMsgHeader));
             resp_payload[0] = scanout_id;
-            resp_payload[1] = 1;  /* success */
+            resp_payload[1] = (ret == 0) ? 1 : 0;
             snprintf((char *)(resp_payload + 2), 64, "Virtual-%u", scanout_id + 1);
             send(fe->vsock_fd, resp_buf, sizeof(resp_buf), 0);
             return HELIX_ERR_OK;
@@ -1312,18 +1300,7 @@ int helix_frame_export_process_msg(HelixFrameExport *fe,
                 return HELIX_ERR_INVALID_MSG;
             }
             uint32_t scanout_id = *(uint32_t *)(data + sizeof(HelixMsgHeader));
-
-            VirtIOGPUBase *g = VIRTIO_GPU_BASE(fe->virtio_gpu);
-            if (scanout_id >= g->conf.max_outputs || scanout_id == 0) {
-                return HELIX_ERR_INVALID_MSG;
-            }
-
-            g->req_state[scanout_id].width = 0;
-            g->req_state[scanout_id].height = 0;
-            g->enabled_output_bitmask &= ~(1 << scanout_id);
-            virtio_gpu_notify_event(g, VIRTIO_GPU_EVENT_DISPLAY);
-
-            error_report("[HELIX] Scanout %u disabled\n", scanout_id);
+            helix_disable_scanout(fe->virtio_gpu, scanout_id);
             return HELIX_ERR_OK;
         }
 
