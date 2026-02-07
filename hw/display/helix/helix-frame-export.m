@@ -2027,13 +2027,20 @@ static void *client_handler_thread(void *arg)
             uint32_t scanout_id;
             if (!read_exact_bytes(client_fd, &scanout_id, 4)) break;
 
-            helix_log("[HELIX] Client %d subscribing to scanout %u",
-                      client_idx, scanout_id);
+            helix_log("[HELIX] Client %d subscribing to scanout %u (fe=%p g_fe=%p)",
+                      client_idx, scanout_id, (void *)fe, (void *)g_helix_export);
 
             pthread_mutex_lock(&fe->clients_lock);
             fe->clients[client_idx].subscribed = true;
             fe->clients[client_idx].subscribed_scanout = scanout_id;
             pthread_mutex_unlock(&fe->clients_lock);
+
+            /* Verify by checking immediately */
+            helix_log("[HELIX] After subscribe: client[%d].active=%d .subscribed=%d .scanout=%u",
+                      client_idx,
+                      fe->clients[client_idx].active,
+                      fe->clients[client_idx].subscribed,
+                      fe->clients[client_idx].subscribed_scanout);
 
             /* Send subscribe response */
             uint8_t resp_buf[sizeof(HelixMsgHeader) + 8];
