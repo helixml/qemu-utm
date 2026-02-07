@@ -693,6 +693,9 @@ static void helix_update_scanout_displaysurface(VirtIOGPU *g,
 
         error_report("[HELIX] Updated DisplaySurface for scanout %u from resource %u (%ux%u)",
                      scanout_id, resource_id, width, height);
+
+        /* Trigger auto-encoding for subscribed clients */
+        helix_scanout_frame_ready(g, scanout_id, resource_id);
     } else {
         error_report("[HELIX] virgl_renderer_transfer_read_iov failed: ret=%d", ret);
     }

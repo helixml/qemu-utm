@@ -1525,6 +1525,645 @@ static void *vsock_server_thread(void *arg)
     return NULL;
 }
 
+/* ========================================================================
+ * Multi-client / Multi-scanout support
+ * ======================================================================== */
+
+/* Global singleton */
+static HelixFrameExport *g_helix_export = NULL;
+
+HelixFrameExport *helix_get_frame_export(void)
+{
+    return g_helix_export;
+}
+
+/*
+ * Send H.264 data to all clients subscribed to a specific scanout.
+ * Called from encoder callback with encoded frame data.
+ */
+static void helix_send_to_subscribed_clients(HelixFrameExport *fe,
+                                               uint32_t scanout_id,
+                                               const uint8_t *response_data,
+                                               size_t response_size)
+{
+    pthread_mutex_lock(&fe->clients_lock);
+    for (int i = 0; i < HELIX_MAX_CLIENTS; i++) {
+        HelixClient *c = &fe->clients[i];
+        if (!c->active || !c->subscribed) continue;
+        if (c->subscribed_scanout != scanout_id) continue;
+
+        pthread_mutex_lock(&c->send_lock);
+        ssize_t sent = send(c->fd, response_data, response_size, MSG_NOSIGNAL);
+        if (sent < 0) {
+            helix_log("[HELIX] Failed to send to client %d (scanout %u): %s",
+                      i, scanout_id, strerror(errno));
+        }
+        pthread_mutex_unlock(&c->send_lock);
+    }
+    pthread_mutex_unlock(&fe->clients_lock);
+}
+
+/*
+ * Encoder output callback for per-scanout auto-encoding.
+ * The outputCallbackRefCon is a packed uint64: high32=scanout_id, low32=0.
+ * The sourceFrameRefCon is the pts.
+ */
+typedef struct ScanoutEncoderCtx {
+    HelixFrameExport *fe;
+    uint32_t scanout_id;
+} ScanoutEncoderCtx;
+
+static void scanout_encoder_callback(void *outputCallbackRefCon,
+                                       void *sourceFrameRefCon,
+                                       OSStatus status,
+                                       VTEncodeInfoFlags infoFlags,
+                                       CMSampleBufferRef sampleBuffer)
+{
+    ScanoutEncoderCtx *ctx = (ScanoutEncoderCtx *)outputCallbackRefCon;
+    if (!ctx || !ctx->fe || !ctx->fe->valid) return;
+
+    HelixFrameExport *fe = ctx->fe;
+    uint32_t scanout_id = ctx->scanout_id;
+    int64_t pts = (int64_t)sourceFrameRefCon;
+
+    if (status != noErr || !sampleBuffer) {
+        fe->encode_errors++;
+        return;
+    }
+
+    /* Check if this is a keyframe */
+    CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, false);
+    bool is_keyframe = true;
+    if (attachments && CFArrayGetCount(attachments) > 0) {
+        CFDictionaryRef dict = CFArrayGetValueAtIndex(attachments, 0);
+        CFBooleanRef notSync = CFDictionaryGetValue(dict, kCMSampleAttachmentKey_NotSync);
+        if (notSync && CFBooleanGetValue(notSync)) {
+            is_keyframe = false;
+        }
+    }
+
+    /* Extract SPS/PPS for keyframes */
+    uint8_t *sps_pps_data = NULL;
+    size_t sps_pps_size = 0;
+
+    if (is_keyframe) {
+        CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(sampleBuffer);
+        if (fmt) {
+            size_t paramCount = 0;
+            CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                fmt, 0, NULL, NULL, &paramCount, NULL);
+
+            if (paramCount > 0) {
+                size_t total_param_size = 0;
+                for (size_t i = 0; i < paramCount; i++) {
+                    const uint8_t *paramData = NULL;
+                    size_t paramSize = 0;
+                    if (CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                            fmt, i, &paramData, &paramSize, NULL, NULL) == noErr) {
+                        total_param_size += 4 + paramSize;
+                    }
+                }
+
+                sps_pps_data = malloc(total_param_size);
+                if (sps_pps_data) {
+                    size_t offset = 0;
+                    for (size_t i = 0; i < paramCount; i++) {
+                        const uint8_t *paramData = NULL;
+                        size_t paramSize = 0;
+                        if (CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                                fmt, i, &paramData, &paramSize, NULL, NULL) == noErr && paramData) {
+                            sps_pps_data[offset++] = 0x00;
+                            sps_pps_data[offset++] = 0x00;
+                            sps_pps_data[offset++] = 0x00;
+                            sps_pps_data[offset++] = 0x01;
+                            memcpy(sps_pps_data + offset, paramData, paramSize);
+                            offset += paramSize;
+                        }
+                    }
+                    sps_pps_size = offset;
+                }
+            }
+        }
+    }
+
+    /* Get data buffer */
+    CMBlockBufferRef dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer);
+    if (!dataBuffer) {
+        free(sps_pps_data);
+        return;
+    }
+
+    size_t totalLength = 0;
+    char *dataPtr = NULL;
+    if (CMBlockBufferGetDataPointer(dataBuffer, 0, NULL, &totalLength, &dataPtr) != noErr) {
+        free(sps_pps_data);
+        return;
+    }
+
+    /* Convert avcc to Annex B */
+    size_t annexb_size = sps_pps_size + totalLength;
+    uint8_t *annexb_data = malloc(annexb_size);
+    if (!annexb_data) {
+        free(sps_pps_data);
+        return;
+    }
+
+    size_t src_offset = 0, dst_offset = 0;
+
+    if (sps_pps_data && sps_pps_size > 0) {
+        memcpy(annexb_data, sps_pps_data, sps_pps_size);
+        dst_offset = sps_pps_size;
+        free(sps_pps_data);
+        sps_pps_data = NULL;
+    }
+
+    while (src_offset + 4 <= totalLength) {
+        uint32_t nal_len = ((uint8_t)dataPtr[src_offset] << 24) |
+                           ((uint8_t)dataPtr[src_offset + 1] << 16) |
+                           ((uint8_t)dataPtr[src_offset + 2] << 8) |
+                           ((uint8_t)dataPtr[src_offset + 3]);
+        src_offset += 4;
+        if (src_offset + nal_len > totalLength) break;
+
+        annexb_data[dst_offset++] = 0x00;
+        annexb_data[dst_offset++] = 0x00;
+        annexb_data[dst_offset++] = 0x00;
+        annexb_data[dst_offset++] = 0x01;
+        memcpy(annexb_data + dst_offset, dataPtr + src_offset, nal_len);
+        dst_offset += nal_len;
+        src_offset += nal_len;
+    }
+
+    /* Build response with scanout_id as session_id */
+    size_t response_size = sizeof(HelixFrameResponse) + sizeof(uint32_t) + dst_offset;
+    uint8_t *response = malloc(response_size);
+    if (!response) {
+        free(annexb_data);
+        return;
+    }
+
+    HelixFrameResponse *resp = (HelixFrameResponse *)response;
+    resp->header.magic = HELIX_MSG_MAGIC;
+    resp->header.msg_type = HELIX_MSG_FRAME_RESPONSE;
+    resp->header.flags = 0;
+    resp->header.session_id = (uint16_t)scanout_id;
+    resp->header.payload_size = response_size - sizeof(HelixMsgHeader);
+
+    CMTime decode_time = CMSampleBufferGetDecodeTimeStamp(sampleBuffer);
+    resp->pts = pts;
+    resp->dts = CMTimeGetSeconds(decode_time) * 1000000000LL;
+    resp->is_keyframe = is_keyframe ? 1 : 0;
+    resp->nal_count = 1;
+
+    uint32_t nal_size = (uint32_t)dst_offset;
+    memcpy(response + sizeof(HelixFrameResponse), &nal_size, sizeof(nal_size));
+    memcpy(response + sizeof(HelixFrameResponse) + sizeof(uint32_t),
+           annexb_data, dst_offset);
+    free(annexb_data);
+
+    /* Also send to legacy single-client if it matches */
+    pthread_mutex_lock(&fe->mutex);
+    if (fe->vsock_fd >= 0 && fe->session_id == scanout_id) {
+        send(fe->vsock_fd, response, response_size, 0);
+    }
+    pthread_mutex_unlock(&fe->mutex);
+
+    /* Send to all subscribed multi-clients */
+    helix_send_to_subscribed_clients(fe, scanout_id, response, response_size);
+
+    fe->frames_encoded++;
+    free(response);
+}
+
+/* Per-scanout encoder context storage (leaked intentionally - lives for process lifetime) */
+static ScanoutEncoderCtx g_scanout_ctx[HELIX_MAX_SCANOUTS];
+
+/*
+ * Create per-scanout encoder session
+ */
+static int create_scanout_encoder(HelixFrameExport *fe, uint32_t scanout_id,
+                                    int32_t width, int32_t height)
+{
+    if (scanout_id >= HELIX_MAX_SCANOUTS) return -1;
+
+    HelixScanoutEncoder *enc = &fe->scanout_encoders[scanout_id];
+
+    /* Clean up existing session */
+    if (enc->session) {
+        VTCompressionSessionCompleteFrames(enc->session, kCMTimeInvalid);
+        VTCompressionSessionInvalidate(enc->session);
+        CFRelease(enc->session);
+        enc->session = NULL;
+    }
+
+    /* Source image attributes */
+    CFMutableDictionaryRef sourceAttrs = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 0,
+        &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks);
+    CFDictionarySetValue(sourceAttrs, kCVPixelBufferIOSurfacePropertiesKey,
+        CFDictionaryCreate(kCFAllocatorDefault, NULL, NULL, 0,
+                           &kCFTypeDictionaryKeyCallBacks,
+                           &kCFTypeDictionaryValueCallBacks));
+
+    /* Set up callback context */
+    g_scanout_ctx[scanout_id].fe = fe;
+    g_scanout_ctx[scanout_id].scanout_id = scanout_id;
+
+    OSStatus status = VTCompressionSessionCreate(
+        kCFAllocatorDefault, width, height,
+        kCMVideoCodecType_H264,
+        NULL, sourceAttrs, NULL,
+        scanout_encoder_callback,
+        &g_scanout_ctx[scanout_id],
+        &enc->session);
+
+    CFRelease(sourceAttrs);
+
+    if (status != noErr) {
+        helix_log("[HELIX] VTCompressionSessionCreate failed for scanout %u: %d",
+                  scanout_id, (int)status);
+        return -1;
+    }
+
+    /* Configure for low-latency streaming */
+    VTSessionSetProperty(enc->session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
+    VTSessionSetProperty(enc->session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+
+    int maxKeyFrame = 60;
+    CFNumberRef maxKeyFrameRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &maxKeyFrame);
+    VTSessionSetProperty(enc->session, kVTCompressionPropertyKey_MaxKeyFrameInterval, maxKeyFrameRef);
+    CFRelease(maxKeyFrameRef);
+
+    int bitrate = 8000000;
+    CFNumberRef bitrateRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &bitrate);
+    VTSessionSetProperty(enc->session, kVTCompressionPropertyKey_AverageBitRate, bitrateRef);
+    CFRelease(bitrateRef);
+
+    VTSessionSetProperty(enc->session, kVTCompressionPropertyKey_ProfileLevel,
+                         kVTProfileLevel_H264_Baseline_AutoLevel);
+
+    status = VTCompressionSessionPrepareToEncodeFrames(enc->session);
+    if (status != noErr) {
+        helix_log("[HELIX] PrepareToEncodeFrames failed for scanout %u: %d",
+                  scanout_id, (int)status);
+        CFRelease(enc->session);
+        enc->session = NULL;
+        return -1;
+    }
+
+    enc->width = width;
+    enc->height = height;
+    enc->configured = true;
+
+    helix_log("[HELIX] Created encoder for scanout %u: %dx%d", scanout_id, width, height);
+    return 0;
+}
+
+/*
+ * Auto-encode a scanout frame on page flip.
+ * Called from helix_update_scanout_displaysurface() in virtio-gpu-virgl.c
+ * whenever a scanout's DisplaySurface is updated.
+ *
+ * This function:
+ * 1. Checks if any clients are subscribed to this scanout
+ * 2. Creates/updates the per-scanout encoder if needed
+ * 3. Gets the DisplaySurface pixels as an IOSurface
+ * 4. Encodes with VideoToolbox
+ * 5. The callback sends H.264 to subscribed clients
+ */
+void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
+                                uint32_t resource_id)
+{
+    HelixFrameExport *fe = g_helix_export;
+    if (!fe || !fe->valid || scanout_id >= HELIX_MAX_SCANOUTS) return;
+    if (scanout_id == 0) return;  /* Don't auto-encode VM console */
+
+    /* Check if anyone is subscribed to this scanout */
+    bool has_subscriber = false;
+    pthread_mutex_lock(&fe->clients_lock);
+    for (int i = 0; i < HELIX_MAX_CLIENTS; i++) {
+        if (fe->clients[i].active && fe->clients[i].subscribed &&
+            fe->clients[i].subscribed_scanout == scanout_id) {
+            has_subscriber = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&fe->clients_lock);
+
+    if (!has_subscriber) return;
+
+    /* Get DisplaySurface data */
+    IOSurfaceRef surface = helix_get_iosurface_from_scanout(virtio_gpu, scanout_id);
+    if (!surface) return;
+
+    /* Get dimensions from surface */
+    uint32_t width = (uint32_t)IOSurfaceGetWidth(surface);
+    uint32_t height = (uint32_t)IOSurfaceGetHeight(surface);
+
+    if (width == 0 || height == 0) {
+        CFRelease(surface);
+        return;
+    }
+
+    /* Create or update encoder */
+    HelixScanoutEncoder *enc = &fe->scanout_encoders[scanout_id];
+    if (!enc->configured || enc->width != (int32_t)width || enc->height != (int32_t)height) {
+        if (create_scanout_encoder(fe, scanout_id, width, height) != 0) {
+            CFRelease(surface);
+            return;
+        }
+    }
+
+    /* Create CVPixelBuffer from IOSurface (zero-copy) */
+    CVPixelBufferRef pixelBuffer = NULL;
+    CVReturn cvRet = CVPixelBufferCreateWithIOSurface(
+        kCFAllocatorDefault, surface, NULL, &pixelBuffer);
+
+    if (cvRet != kCVReturnSuccess || !pixelBuffer) {
+        CFRelease(surface);
+        return;
+    }
+
+    /* Generate monotonic PTS */
+    enc->frame_count++;
+    int64_t pts = enc->frame_count * 16666667;  /* ~60fps in nanoseconds */
+    CMTime cmPts = CMTimeMake(pts, 1000000000);
+    CMTime cmDuration = CMTimeMake(16666667, 1000000000);
+
+    /* Force keyframe on first frame */
+    CFMutableDictionaryRef frameProps = NULL;
+    if (enc->frame_count == 1) {
+        frameProps = CFDictionaryCreateMutable(
+            kCFAllocatorDefault, 1,
+            &kCFTypeDictionaryKeyCallBacks,
+            &kCFTypeDictionaryValueCallBacks);
+        CFDictionarySetValue(frameProps,
+                             kVTEncodeFrameOptionKey_ForceKeyFrame,
+                             kCFBooleanTrue);
+    }
+
+    /* Encode */
+    VTCompressionSessionEncodeFrame(
+        enc->session, pixelBuffer, cmPts, cmDuration,
+        frameProps, (void *)pts, NULL);
+
+    if (frameProps) CFRelease(frameProps);
+    CVPixelBufferRelease(pixelBuffer);
+    CFRelease(surface);
+}
+
+/* ========================================================================
+ * Multi-client TCP server
+ * ======================================================================== */
+
+/*
+ * Add a client to the client list. Returns client index or -1.
+ */
+static int helix_add_client(HelixFrameExport *fe, int fd)
+{
+    pthread_mutex_lock(&fe->clients_lock);
+    for (int i = 0; i < HELIX_MAX_CLIENTS; i++) {
+        if (!fe->clients[i].active) {
+            fe->clients[i].fd = fd;
+            fe->clients[i].active = true;
+            fe->clients[i].subscribed = false;
+            fe->clients[i].subscribed_scanout = 0;
+            pthread_mutex_init(&fe->clients[i].send_lock, NULL);
+            pthread_mutex_unlock(&fe->clients_lock);
+            helix_log("[HELIX] Added client %d (fd=%d)", i, fd);
+            return i;
+        }
+    }
+    pthread_mutex_unlock(&fe->clients_lock);
+    return -1;
+}
+
+/*
+ * Remove a client from the client list.
+ */
+static void helix_remove_client(HelixFrameExport *fe, int client_idx)
+{
+    pthread_mutex_lock(&fe->clients_lock);
+    if (client_idx >= 0 && client_idx < HELIX_MAX_CLIENTS) {
+        HelixClient *c = &fe->clients[client_idx];
+        if (c->active) {
+            helix_log("[HELIX] Removing client %d (fd=%d, scanout=%u)",
+                      client_idx, c->fd, c->subscribed_scanout);
+            close(c->fd);
+            c->active = false;
+            c->subscribed = false;
+            pthread_mutex_destroy(&c->send_lock);
+        }
+    }
+    pthread_mutex_unlock(&fe->clients_lock);
+}
+
+/*
+ * Per-client handler thread.
+ * Reads messages from a single client and handles SUBSCRIBE, ENABLE_SCANOUT, etc.
+ */
+typedef struct ClientThreadArg {
+    HelixFrameExport *fe;
+    int client_idx;
+} ClientThreadArg;
+
+static void *client_handler_thread(void *arg)
+{
+    ClientThreadArg *cta = (ClientThreadArg *)arg;
+    HelixFrameExport *fe = cta->fe;
+    int client_idx = cta->client_idx;
+    int client_fd = fe->clients[client_idx].fd;
+    free(cta);
+
+    helix_log("[HELIX] Client %d handler started (fd=%d)", client_idx, client_fd);
+
+    while (1) {
+        HelixMsgHeader header;
+        if (!read_exact_bytes(client_fd, &header, sizeof(header))) {
+            break;
+        }
+
+        if (header.magic != HELIX_MSG_MAGIC) {
+            helix_log("[HELIX] Client %d: invalid magic 0x%x", client_idx, header.magic);
+            break;
+        }
+
+        if (header.msg_type == HELIX_MSG_SUBSCRIBE) {
+            /* Read subscribe payload: scanout_id (4 bytes) */
+            uint32_t scanout_id;
+            if (!read_exact_bytes(client_fd, &scanout_id, 4)) break;
+
+            helix_log("[HELIX] Client %d subscribing to scanout %u",
+                      client_idx, scanout_id);
+
+            pthread_mutex_lock(&fe->clients_lock);
+            fe->clients[client_idx].subscribed = true;
+            fe->clients[client_idx].subscribed_scanout = scanout_id;
+            pthread_mutex_unlock(&fe->clients_lock);
+
+            /* Send subscribe response */
+            uint8_t resp_buf[sizeof(HelixMsgHeader) + 8];
+            HelixMsgHeader *resp_hdr = (HelixMsgHeader *)resp_buf;
+            resp_hdr->magic = HELIX_MSG_MAGIC;
+            resp_hdr->msg_type = HELIX_MSG_SUBSCRIBE_RESP;
+            resp_hdr->flags = 0;
+            resp_hdr->session_id = (uint16_t)scanout_id;
+            resp_hdr->payload_size = 8;
+            uint32_t *resp_data = (uint32_t *)(resp_buf + sizeof(HelixMsgHeader));
+            resp_data[0] = scanout_id;
+            resp_data[1] = 1;  /* success */
+
+            pthread_mutex_lock(&fe->clients[client_idx].send_lock);
+            send(client_fd, resp_buf, sizeof(resp_buf), 0);
+            pthread_mutex_unlock(&fe->clients[client_idx].send_lock);
+
+        } else if (header.msg_type == HELIX_MSG_ENABLE_SCANOUT) {
+            uint32_t payload[4];
+            if (!read_exact_bytes(client_fd, payload, 16)) break;
+
+            int result = helix_enable_scanout(fe->virtio_gpu, payload[0],
+                                              payload[1], payload[2]);
+
+            uint8_t resp_buf[sizeof(HelixMsgHeader) + 72];
+            memset(resp_buf, 0, sizeof(resp_buf));
+            HelixMsgHeader *resp_hdr = (HelixMsgHeader *)resp_buf;
+            resp_hdr->magic = HELIX_MSG_MAGIC;
+            resp_hdr->msg_type = HELIX_MSG_SCANOUT_RESP;
+            resp_hdr->session_id = header.session_id;
+            resp_hdr->payload_size = 72;
+            uint32_t *resp_data = (uint32_t *)(resp_buf + sizeof(HelixMsgHeader));
+            resp_data[0] = payload[0];
+            resp_data[1] = (result == 0) ? 1 : 0;
+            snprintf((char *)(resp_data + 2), 64, "Virtual-%u", payload[0] + 1);
+
+            pthread_mutex_lock(&fe->clients[client_idx].send_lock);
+            send(client_fd, resp_buf, sizeof(resp_buf), 0);
+            pthread_mutex_unlock(&fe->clients[client_idx].send_lock);
+
+        } else if (header.msg_type == HELIX_MSG_DISABLE_SCANOUT) {
+            uint32_t scanout_id;
+            if (!read_exact_bytes(client_fd, &scanout_id, 4)) break;
+            helix_disable_scanout(fe->virtio_gpu, scanout_id);
+
+        } else if (header.msg_type == HELIX_MSG_PING) {
+            HelixMsgHeader pong = {
+                .magic = HELIX_MSG_MAGIC,
+                .msg_type = HELIX_MSG_PONG,
+                .session_id = header.session_id,
+                .payload_size = 0
+            };
+            pthread_mutex_lock(&fe->clients[client_idx].send_lock);
+            send(client_fd, &pong, sizeof(pong), 0);
+            pthread_mutex_unlock(&fe->clients[client_idx].send_lock);
+
+        } else if (header.msg_type == HELIX_MSG_FRAME_REQUEST) {
+            /* Legacy: handle frame request from this client */
+            HelixFrameRequest req;
+            memcpy(&req.header, &header, sizeof(header));
+            size_t remaining = sizeof(HelixFrameRequest) - sizeof(HelixMsgHeader);
+            if (!read_exact_bytes(client_fd, ((uint8_t *)&req) + sizeof(HelixMsgHeader),
+                                  remaining)) break;
+
+            uint8_t *pixel_data = NULL;
+            size_t pixel_data_size = 0;
+            if (header.flags & HELIX_FLAG_PIXEL_DATA) {
+                pixel_data_size = header.payload_size - remaining;
+                if (pixel_data_size > 0 && pixel_data_size <= 64 * 1024 * 1024) {
+                    pixel_data = malloc(pixel_data_size);
+                    if (pixel_data && !read_exact_bytes(client_fd, pixel_data, pixel_data_size)) {
+                        free(pixel_data);
+                        break;
+                    }
+                }
+            }
+
+            /* For legacy frame requests, set vsock_fd to this client temporarily */
+            pthread_mutex_lock(&fe->mutex);
+            int old_fd = fe->vsock_fd;
+            fe->vsock_fd = client_fd;
+            pthread_mutex_unlock(&fe->mutex);
+
+            handle_frame_request(fe, &req, pixel_data, pixel_data_size);
+            free(pixel_data);
+
+            pthread_mutex_lock(&fe->mutex);
+            fe->vsock_fd = old_fd;
+            pthread_mutex_unlock(&fe->mutex);
+
+        } else {
+            /* Skip unknown messages */
+            if (header.payload_size > 0 && header.payload_size < 64 * 1024 * 1024) {
+                uint8_t *skip = malloc(header.payload_size);
+                if (skip) {
+                    read_exact_bytes(client_fd, skip, header.payload_size);
+                    free(skip);
+                }
+            }
+        }
+    }
+
+    helix_log("[HELIX] Client %d disconnected", client_idx);
+    helix_remove_client(fe, client_idx);
+    return NULL;
+}
+
+/*
+ * Multi-client accept thread - spawns a handler thread per client
+ */
+static void *multi_accept_thread(void *arg)
+{
+    HelixFrameExport *fe = (HelixFrameExport *)arg;
+
+    while (1) {
+        helix_log("[HELIX] Waiting for client connection...");
+
+        int client_fd = accept(fe->listen_fd, NULL, NULL);
+        if (client_fd < 0) {
+            if (errno == EINTR) continue;
+            helix_log("[HELIX] Accept failed: %s", strerror(errno));
+            break;
+        }
+
+        helix_log("[HELIX] Client connected (fd=%d)", client_fd);
+
+        int keepalive = 1;
+        setsockopt(client_fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+
+        struct timeval tv = { .tv_sec = 600, .tv_usec = 0 };
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        int client_idx = helix_add_client(fe, client_fd);
+        if (client_idx < 0) {
+            helix_log("[HELIX] No client slots available, rejecting");
+            close(client_fd);
+            continue;
+        }
+
+        /* Also set legacy vsock_fd for backward compat (first client) */
+        pthread_mutex_lock(&fe->mutex);
+        if (fe->vsock_fd < 0 || fe->vsock_fd == fe->listen_fd) {
+            fe->vsock_fd = client_fd;
+        }
+        pthread_mutex_unlock(&fe->mutex);
+
+        ClientThreadArg *cta = malloc(sizeof(ClientThreadArg));
+        cta->fe = fe;
+        cta->client_idx = client_idx;
+
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, client_handler_thread, cta) != 0) {
+            helix_log("[HELIX] Failed to create client thread");
+            free(cta);
+            helix_remove_client(fe, client_idx);
+            continue;
+        }
+        pthread_detach(thread);
+    }
+
+    return NULL;
+}
+
 /*
  * Initialize frame export subsystem
  * This would be called from virtio_gpu_virgl_init() in QEMU
@@ -1532,35 +2171,44 @@ static void *vsock_server_thread(void *arg)
 int helix_frame_export_init(void *virtio_gpu, int vsock_port)
 {
     error_report("========================================");
-    error_report("[HELIX] VERSION: 2026-02-06-v5-long-timeout");
-    error_report("[HELIX] BUILD: TCP listener, no socat needed");
+    error_report("[HELIX] VERSION: 2026-02-07-v6-multi-scanout");
+    error_report("[HELIX] BUILD: Multi-client, per-scanout auto-encode");
     error_report("========================================");
     error_report("[HELIX] Initializing frame export on vsock port %d", vsock_port);
 
     HelixFrameExport *fe = calloc(1, sizeof(HelixFrameExport));
     if (!fe) {
-        error_report("[HELIX-DEBUG] Failed to allocate HelixFrameExport");
+        error_report("[HELIX] Failed to allocate HelixFrameExport");
         return -1;
     }
 
-    /* Initialize thread safety */
     pthread_mutex_init(&fe->mutex, NULL);
+    pthread_mutex_init(&fe->clients_lock, NULL);
     fe->valid = true;
-
     fe->virtio_gpu = virtio_gpu;
     fe->vsock_fd = -1;
-    fe->session_id = 1;  /* Default session */
+    fe->listen_fd = -1;
+    fe->session_id = 1;
 
-    /*
-     * Set up TCP socket listener for helix frame export protocol
-     *
-     * Guest connects to 10.0.2.2:<port> via QEMU user-mode networking.
-     * SLiRP forwards this to 127.0.0.1:<port> on the host, which is
-     * where we listen. No socat proxy needed.
-     */
+    /* Initialize client slots */
+    for (int i = 0; i < HELIX_MAX_CLIENTS; i++) {
+        fe->clients[i].active = false;
+        fe->clients[i].fd = -1;
+    }
+
+    /* Initialize scanout encoder slots */
+    for (int i = 0; i < HELIX_MAX_SCANOUTS; i++) {
+        fe->scanout_encoders[i].session = NULL;
+        fe->scanout_encoders[i].configured = false;
+    }
+
+    /* Set global singleton */
+    g_helix_export = fe;
+
+    /* Set up TCP socket listener */
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
-        error_report("Failed to create TCP socket: %s\n", strerror(errno));
+        error_report("Failed to create TCP socket: %s", strerror(errno));
         free(fe);
         return -1;
     }
@@ -1575,100 +2223,36 @@ int helix_frame_export_init(void *virtio_gpu, int vsock_port)
     addr.sin_port = htons(vsock_port);
 
     if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        error_report("Failed to bind TCP socket on port %d: %s\n",
+        error_report("Failed to bind TCP socket on port %d: %s",
                      vsock_port, strerror(errno));
         close(listen_fd);
         free(fe);
         return -1;
     }
 
-    if (listen(listen_fd, 5) < 0) {
-        error_report("Failed to listen on TCP socket: %s\n", strerror(errno));
+    if (listen(listen_fd, 16) < 0) {
+        error_report("Failed to listen on TCP socket: %s", strerror(errno));
         close(listen_fd);
         free(fe);
         return -1;
     }
 
-    error_report("[HELIX] Frame export ready: TCP 127.0.0.1:%d (guest: 10.0.2.2:%d)\n",
+    fe->listen_fd = listen_fd;
+
+    error_report("[HELIX] Frame export ready: TCP 127.0.0.1:%d (guest: 10.0.2.2:%d)",
                  vsock_port, vsock_port);
 
-    /* Accept connections in background thread */
+    /* Start multi-client accept thread */
     pthread_t thread;
-    fe->vsock_fd = listen_fd;  /* Store listen fd temporarily */
-    if (pthread_create(&thread, NULL, vsock_accept_thread, fe) != 0) {
-        error_report("Failed to create accept thread: %s\n", strerror(errno));
+    if (pthread_create(&thread, NULL, multi_accept_thread, fe) != 0) {
+        error_report("Failed to create accept thread: %s", strerror(errno));
         close(listen_fd);
         free(fe);
         return -1;
     }
-
     pthread_detach(thread);
 
-    /* Store in virtio-gpu device for later access */
-    /* TODO: Add helix_frame_export field to VirtIOGPU struct */
-
     return 0;
-}
-
-/*
- * Accept thread - waits for guest connections
- */
-static void *vsock_accept_thread(void *arg)
-{
-    HelixFrameExport *fe = (HelixFrameExport *)arg;
-    int listen_fd = fe->vsock_fd;
-
-    while (1) {
-        error_report("[HELIX] Waiting for guest connection...");
-
-        int client_fd = accept(listen_fd, NULL, NULL);
-        if (client_fd < 0) {
-            if (errno == EINTR) continue;
-            error_report("[HELIX] Accept failed: %s", strerror(errno));
-            break;
-        }
-
-        error_report("[HELIX] Guest connected!");
-
-        /* Enable TCP keepalive to detect dead connections */
-        int keepalive = 1;
-        setsockopt(client_fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
-
-        /* Set receive timeout (10 min) - must be long enough for idle desktops.
-         * PipeWire ScreenCast is damage-based: static screens produce zero frames.
-         * SO_KEEPALIVE handles dead connection detection at TCP level. */
-        struct timeval tv;
-        tv.tv_sec = 600;
-        tv.tv_usec = 0;
-        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-        /* Update vsock_fd to client connection */
-        fe->vsock_fd = client_fd;
-
-        /* Handle this client connection */
-        vsock_server_thread(fe);
-
-        /* Client disconnected */
-        helix_log("[HELIX] Guest disconnected");
-
-        /* Close socket - callbacks will check vsock_fd < 0 before sending */
-        close(client_fd);
-        fe->vsock_fd = -1;
-
-        /*
-         * DO NOT destroy encoder session here - VideoToolbox callbacks are async
-         * and may still fire. The callbacks check if vsock_fd < 0 and discard frames.
-         * The encoder session will be reused for the next client or destroyed on shutdown.
-         */
-
-        /* Sleep briefly to ensure any pending callbacks finish */
-        usleep(50000);  /* 50ms */
-
-        /* Back to listening */
-        fe->vsock_fd = listen_fd;
-    }
-
-    return NULL;
 }
 
 #endif /* __APPLE__ */

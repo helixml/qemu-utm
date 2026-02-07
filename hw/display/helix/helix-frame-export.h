@@ -36,6 +36,8 @@
 #define HELIX_MSG_ENABLE_SCANOUT  0x20  /* Guest -> Host: connect DRM connector */
 #define HELIX_MSG_DISABLE_SCANOUT 0x21  /* Guest -> Host: disconnect DRM connector */
 #define HELIX_MSG_SCANOUT_RESP    0x22  /* Host -> Guest: scanout enable/disable result */
+#define HELIX_MSG_SUBSCRIBE       0x30  /* Client -> Host: subscribe to scanout stream */
+#define HELIX_MSG_SUBSCRIBE_RESP  0x31  /* Host -> Client: subscription confirmed */
 #define HELIX_MSG_ERROR           0xFF  /* Error response */
 
 /* Frame request flags */
@@ -116,15 +118,40 @@ typedef struct HelixErrorResponse {
 
 #ifdef __APPLE__
 
+#define HELIX_MAX_CLIENTS  16
+#define HELIX_MAX_SCANOUTS 16
+
 /*
- * Frame export context - created per session
+ * Per-client connection state
+ */
+typedef struct HelixClient {
+    int fd;
+    uint32_t subscribed_scanout;  /* which scanout this client receives */
+    bool active;
+    bool subscribed;              /* has sent SUBSCRIBE message */
+    pthread_mutex_t send_lock;    /* protects send() on this fd */
+} HelixClient;
+
+/*
+ * Per-scanout encoder state
+ */
+typedef struct HelixScanoutEncoder {
+    VTCompressionSessionRef session;
+    int32_t width;
+    int32_t height;
+    bool configured;
+    uint64_t frame_count;
+} HelixScanoutEncoder;
+
+/*
+ * Frame export context - singleton, manages all scanouts and clients
  */
 typedef struct HelixFrameExport {
     /* Thread safety */
     pthread_mutex_t mutex;
-    bool valid;  /* Set to false before destruction */
+    bool valid;
 
-    /* Encoder state */
+    /* Legacy single-client encoder (scanout 0 / pixel data mode) */
     VTCompressionSessionRef encoder_session;
     int32_t width;
     int32_t height;
@@ -132,12 +159,18 @@ typedef struct HelixFrameExport {
     bool realtime;
     bool configured;
 
-    /* vsock connection */
+    /* Legacy vsock connection (backward compat) */
     int vsock_fd;
     uint16_t session_id;
 
+    /* Multi-scanout encoders */
+    HelixScanoutEncoder scanout_encoders[HELIX_MAX_SCANOUTS];
+
+    /* Multi-client connections */
+    HelixClient clients[HELIX_MAX_CLIENTS];
+    pthread_mutex_t clients_lock;
+
     /* Pending frame response queue */
-    /* (encoder callbacks are async, need to queue responses) */
     void *response_queue;  /* dispatch_queue_t */
 
     /* Statistics */
@@ -147,6 +180,9 @@ typedef struct HelixFrameExport {
 
     /* Reference to virtio-gpu for resource lookup */
     void *virtio_gpu;
+
+    /* TCP listener fd */
+    int listen_fd;
 } HelixFrameExport;
 
 /*
@@ -200,6 +236,20 @@ int helix_encode_iosurface(HelixFrameExport *fe,
                            int64_t pts,
                            int64_t duration,
                            bool force_keyframe);
+
+/*
+ * Auto-encode a scanout frame on page flip (damage-based).
+ * Called from helix_update_scanout_displaysurface() in virtio-gpu-virgl.c.
+ * Encodes the scanout's DisplaySurface and pushes H.264 to subscribed clients.
+ */
+void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
+                                uint32_t resource_id);
+
+/*
+ * Get the global HelixFrameExport instance.
+ * Returns NULL if not initialized.
+ */
+HelixFrameExport *helix_get_frame_export(void);
 
 #endif /* __APPLE__ */
 
