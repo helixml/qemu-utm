@@ -1885,21 +1885,28 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
                   ready_count, scanout_id, resource_id);
     }
 
-    /* Get DisplaySurface data */
-    IOSurfaceRef surface = helix_get_iosurface_from_scanout(virtio_gpu, scanout_id);
-    if (!surface) {
-        if (ready_count <= 5 || (ready_count % 100) == 0) {
-            helix_log("[FRAME_READY] No IOSurface for scanout %u", scanout_id);
-        }
+    /*
+     * Get the resource ID for this scanout, then read pixels directly from the
+     * GPU resource into our cached IOSurface. This avoids the triple-copy:
+     *   OLD: GPU → temp buffer → DisplaySurface → IOSurface (3x 59MB at 5K)
+     *   NEW: GPU → IOSurface (1x 59MB at 5K)
+     */
+    uint32_t res_id = virtio_gpu_get_scanout_resource_id(virtio_gpu, scanout_id);
+    if (res_id == 0) {
         return;
     }
 
-    /* Get dimensions from surface */
-    uint32_t width = (uint32_t)IOSurfaceGetWidth(surface);
-    uint32_t height = (uint32_t)IOSurfaceGetHeight(surface);
+    struct virgl_renderer_resource_info_ext info_ext = {0};
+    int ret = virgl_renderer_resource_get_info_ext(res_id, &info_ext);
+    if (ret != 0) {
+        return;
+    }
+
+    uint32_t width = info_ext.base.width;
+    uint32_t height = info_ext.base.height;
+    uint32_t stride = info_ext.base.stride;
 
     if (width == 0 || height == 0) {
-        CFRelease(surface);
         return;
     }
 
@@ -1910,18 +1917,79 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
          * or from previous encoder session (resolution change). 0 = auto-scale. */
         int32_t prev_bitrate = enc->bitrate;
         if (create_scanout_encoder(fe, scanout_id, width, height, prev_bitrate) != 0) {
-            CFRelease(surface);
             return;
+        }
+        /* Invalidate cached IOSurface on resolution change */
+        if (enc->cached_surface) {
+            CFRelease(enc->cached_surface);
+            enc->cached_surface = NULL;
         }
     }
 
-    /* Create CVPixelBuffer from IOSurface (zero-copy) */
+    /* Get or create cached IOSurface for this scanout (avoid alloc/free per frame) */
+    if (!enc->cached_surface) {
+        size_t bytes_per_pixel = 4;
+        size_t row_bytes = width * bytes_per_pixel;
+        CFMutableDictionaryRef props = CFDictionaryCreateMutable(
+            kCFAllocatorDefault, 0,
+            &kCFTypeDictionaryKeyCallBacks,
+            &kCFTypeDictionaryValueCallBacks);
+        CFNumberRef widthNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &width);
+        CFNumberRef heightNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &height);
+        CFNumberRef bytesPerRow = CFNumberCreate(kCFAllocatorDefault, kCFNumberLongType, &row_bytes);
+        uint32_t pixelFormat = kCVPixelFormatType_32BGRA;
+        CFNumberRef pixelFormatNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &pixelFormat);
+        CFDictionarySetValue(props, kIOSurfaceWidth, widthNum);
+        CFDictionarySetValue(props, kIOSurfaceHeight, heightNum);
+        CFDictionarySetValue(props, kIOSurfaceBytesPerRow, bytesPerRow);
+        CFDictionarySetValue(props, kIOSurfacePixelFormat, pixelFormatNum);
+        CFRelease(widthNum);
+        CFRelease(heightNum);
+        CFRelease(bytesPerRow);
+        CFRelease(pixelFormatNum);
+        enc->cached_surface = IOSurfaceCreate(props);
+        CFRelease(props);
+        if (!enc->cached_surface) {
+            helix_log("[FRAME_READY] Failed to create cached IOSurface for scanout %u", scanout_id);
+            return;
+        }
+        helix_log("[FRAME_READY] Created cached IOSurface for scanout %u: %ux%u", scanout_id, width, height);
+    }
+
+    /* Read GPU resource pixels directly into cached IOSurface (single copy) */
+    IOSurfaceLock(enc->cached_surface, 0, NULL);
+    void *surface_base = IOSurfaceGetBaseAddress(enc->cached_surface);
+    size_t row_bytes = width * 4;
+    size_t buffer_size = row_bytes * height;
+
+    struct iovec iov = {
+        .iov_base = surface_base,
+        .iov_len = buffer_size
+    };
+    struct {
+        uint32_t x, y, z, w, h, d;
+    } box = { 0, 0, 0, width, height, 1 };
+
+    virgl_renderer_force_ctx_0();
+    ret = virgl_renderer_transfer_read_iov(
+        res_id, 0, 0, (uint32_t)row_bytes, 0,
+        (struct virgl_box *)&box, 0, &iov, 1);
+
+    IOSurfaceUnlock(enc->cached_surface, 0, NULL);
+
+    if (ret != 0) {
+        if (ready_count <= 5 || (ready_count % 100) == 0) {
+            helix_log("[FRAME_READY] transfer_read_iov failed for scanout %u: %d", scanout_id, ret);
+        }
+        return;
+    }
+
+    /* Create CVPixelBuffer from cached IOSurface (wraps existing surface, no copy) */
     CVPixelBufferRef pixelBuffer = NULL;
     CVReturn cvRet = CVPixelBufferCreateWithIOSurface(
-        kCFAllocatorDefault, surface, NULL, &pixelBuffer);
+        kCFAllocatorDefault, enc->cached_surface, NULL, &pixelBuffer);
 
     if (cvRet != kCVReturnSuccess || !pixelBuffer) {
-        CFRelease(surface);
         return;
     }
 
@@ -1955,7 +2023,6 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
 
     if (frameProps) CFRelease(frameProps);
     CVPixelBufferRelease(pixelBuffer);
-    CFRelease(surface);
 }
 
 /* ========================================================================
@@ -2286,6 +2353,7 @@ int helix_frame_export_init(void *virtio_gpu, int vsock_port)
     for (int i = 0; i < HELIX_MAX_SCANOUTS; i++) {
         fe->scanout_encoders[i].session = NULL;
         fe->scanout_encoders[i].configured = false;
+        fe->scanout_encoders[i].cached_surface = NULL;
     }
 
     /* Set global singleton */

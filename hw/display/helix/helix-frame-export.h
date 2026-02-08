@@ -142,6 +142,7 @@ typedef struct HelixScanoutEncoder {
     int32_t bitrate;        /* Target bitrate in bps (0 = auto-scale from resolution) */
     bool configured;
     uint64_t frame_count;
+    IOSurfaceRef cached_surface;  /* Reusable IOSurface to avoid alloc/free per frame */
 } HelixScanoutEncoder;
 
 /*
