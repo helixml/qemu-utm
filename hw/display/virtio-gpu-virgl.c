@@ -614,18 +614,12 @@ static void helix_update_scanout_displaysurface(VirtIOGPU *g,
                                                  uint32_t scanout_id,
                                                  uint32_t resource_id)
 {
-    helix_debug_log("[UPDATE_DS] scanout=%u resource=%u", scanout_id, resource_id);
-
     if (scanout_id >= g->parent_obj.conf.max_outputs) {
-        helix_debug_log("[UPDATE_DS] ERROR: scanout_id %u >= max_outputs %u",
-                     scanout_id, g->parent_obj.conf.max_outputs);
         return;
     }
 
-    struct virtio_gpu_scanout *scanout = &g->parent_obj.scanout[scanout_id];
-
     if (resource_id == 0) {
-        helix_debug_log("[UPDATE_DS] Scanout %u disabled", scanout_id);
+        struct virtio_gpu_scanout *scanout = &g->parent_obj.scanout[scanout_id];
         if (scanout->ds) {
             qemu_free_displaysurface(scanout->ds);
             scanout->ds = NULL;
@@ -633,110 +627,11 @@ static void helix_update_scanout_displaysurface(VirtIOGPU *g,
         return;
     }
 
-    /* Get resource info */
-    struct virgl_renderer_resource_info_ext info_ext = {0};
-    int ret = virgl_renderer_resource_get_info_ext(resource_id, &info_ext);
-    if (ret != 0) {
-        helix_debug_log("[UPDATE_DS] ERROR: get_info_ext failed for resource %u: ret=%d",
-                     resource_id, ret);
-        return;
-    }
-
-    uint32_t width = info_ext.base.width;
-    uint32_t height = info_ext.base.height;
-    uint32_t stride = info_ext.base.stride;
-
-    if (width == 0 || height == 0) {
-        return;
-    }
-
-    /* Create or recreate DisplaySurface if dimensions changed */
-    if (!scanout->ds ||
-        surface_width(scanout->ds) != width ||
-        surface_height(scanout->ds) != height) {
-
-        if (scanout->ds) {
-            qemu_free_displaysurface(scanout->ds);
-        }
-
-        scanout->ds = qemu_create_displaysurface(width, height);
-        if (!scanout->ds) {
-            error_report("[HELIX] Failed to create DisplaySurface %ux%u", width, height);
-            return;
-        }
-
-        helix_debug_log("[UPDATE_DS] Created DisplaySurface %ux%u for scanout %u",
-                     width, height, scanout_id);
-    }
-
-    /* Copy GPU resource pixels to DisplaySurface */
-    size_t bytes_per_pixel = 4;  /* BGRA8888 */
-    size_t row_bytes = width * bytes_per_pixel;
-    size_t buffer_size = row_bytes * height;
-
-    void *dest_data = surface_data(scanout->ds);
-    uint32_t dest_stride = surface_stride(scanout->ds);
-
-    /* Allocate temporary buffer for readback */
-    void *pixel_data = malloc(buffer_size);
-    if (!pixel_data) {
-        error_report("[HELIX] Failed to allocate pixel buffer");
-        return;
-    }
-
-    struct iovec iov = {
-        .iov_base = pixel_data,
-        .iov_len = buffer_size
-    };
-
-    struct {
-        uint32_t x, y, z;
-        uint32_t w, h, d;
-    } box = {
-        .x = 0, .y = 0, .z = 0,
-        .w = width, .h = height, .d = 1
-    };
-
-    /* Force context 0 before transfer */
-    virgl_renderer_force_ctx_0();
-
-    /* Read pixels from GPU resource */
-    ret = virgl_renderer_transfer_read_iov(
-        resource_id,
-        0,          /* ctx_id */
-        0,          /* level */
-        stride,     /* stride */
-        0,          /* layer_stride */
-        (struct virgl_box *)&box,
-        0,          /* offset */
-        &iov,
-        1           /* iovec_cnt */
-    );
-
-    if (ret == 0) {
-        /* Copy to DisplaySurface (handle stride differences) */
-        if (dest_stride == row_bytes && stride == row_bytes) {
-            /* Fast path: strides match */
-            memcpy(dest_data, pixel_data, buffer_size);
-        } else {
-            /* Slow path: copy row by row */
-            for (uint32_t y = 0; y < height; y++) {
-                memcpy((uint8_t *)dest_data + y * dest_stride,
-                       (uint8_t *)pixel_data + y * row_bytes,
-                       row_bytes);
-            }
-        }
-
-        helix_debug_log("[UPDATE_DS] OK: scanout %u resource %u (%ux%u) -> frame_ready",
-                     scanout_id, resource_id, width, height);
-
-        /* Trigger auto-encoding for subscribed clients */
-        helix_scanout_frame_ready(g, scanout_id, resource_id);
-    } else {
-        helix_debug_log("[UPDATE_DS] ERROR: transfer_read_iov failed: ret=%d", ret);
-    }
-
-    free(pixel_data);
+    /* Trigger frame encoding. If zero-copy Metal IOSurface is available
+     * (captured at SET_SCANOUT time), helix_scanout_frame_ready uses it
+     * directly — no CPU readback needed. Falls back to CPU readback only
+     * if Metal texture has no IOSurface backing. */
+    helix_scanout_frame_ready(g, scanout_id, resource_id);
 }
 #endif
 
