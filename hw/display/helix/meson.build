@@ -20,4 +20,15 @@ if host_machine.system() == 'darwin'
 
   # Also need virglrenderer
   system_ss.add(virgl)
+
+  # OpenGL/EGL via epoxy (for GPU blit path: IOSurface-backed GL texture)
+  if opengl.found()
+    system_ss.add(opengl)
+  endif
+
+  # macOS native OpenGL framework (for CGLGetCurrentContext detection)
+  opengl_framework = dependency('OpenGL', required: false)
+  if opengl_framework.found()
+    system_ss.add(opengl_framework)
+  endif
 endif

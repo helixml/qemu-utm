@@ -148,6 +148,18 @@ typedef struct HelixScanoutEncoder {
     IOSurfaceRef encode_snapshot;   /* Snapshot surface for zero-copy path: copied from
                                      * metal_iosurface on each flush to avoid race between
                                      * virglrenderer writing and VideoToolbox reading */
+
+    /* GPU blit state: EGL/ANGLE IOSurface-backed FBO for zero-copy encoding.
+     * Instead of CPU readback (virgl_renderer_transfer_read_iov), we GPU blit
+     * from virglrenderer's GL texture into an IOSurface-backed texture via
+     * glBlitFramebuffer, then pass the IOSurface to VideoToolbox. */
+    IOSurfaceRef blit_iosurface;    /* IOSurface destination for GPU blit */
+    uint32_t blit_dst_tex;          /* GL texture backed by blit_iosurface */
+    uint32_t blit_dst_fbo;          /* FBO with blit_dst_tex as color attachment */
+    uint32_t blit_src_fbo;          /* FBO for attaching virglrenderer's tex_id */
+    void *blit_egl_surface;         /* EGLSurface pbuffer binding IOSurface to GL */
+    int32_t blit_width;             /* Width of current blit resources */
+    int32_t blit_height;            /* Height of current blit resources */
 } HelixScanoutEncoder;
 
 /*
@@ -190,6 +202,10 @@ typedef struct HelixFrameExport {
 
     /* TCP listener fd */
     int listen_fd;
+
+    /* GPU blit: shared EGL context for IOSurface-backed GL blitting */
+    void *helix_egl_ctx;            /* EGLContext shared with virglrenderer */
+    bool gl_blit_available;         /* true if GPU blit path is operational */
 } HelixFrameExport;
 
 /*
