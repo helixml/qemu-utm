@@ -34,8 +34,8 @@ virtio_gpu_base_reset(VirtIOGPUBase *g)
     g->enabled_output_bitmask = 1;
 
     for (i = 0; i < g->conf.max_outputs; i++) {
-        g->req_state[i].width = (i == 0) ? g->conf.xres : 0;
-        g->req_state[i].height = (i == 0) ? g->conf.yres : 0;
+        g->req_state[i].width = g->conf.xres;
+        g->req_state[i].height = g->conf.yres;
         g->scanout[i].resource_id = 0;
         g->scanout[i].width = 0;
         g->scanout[i].height = 0;
@@ -251,8 +251,11 @@ virtio_gpu_base_device_realize(DeviceState *qdev,
 
     g->enabled_output_bitmask = 1;
 
-    g->req_state[0].width = g->conf.xres;
-    g->req_state[0].height = g->conf.yres;
+    /* Apply preferred EDID resolution to all scanouts, not just scanout 0 */
+    for (i = 0; i < g->conf.max_outputs; i++) {
+        g->req_state[i].width = g->conf.xres;
+        g->req_state[i].height = g->conf.yres;
+    }
 
     g->hw_ops = &virtio_gpu_ops;
     for (i = 0; i < g->conf.max_outputs; i++) {
