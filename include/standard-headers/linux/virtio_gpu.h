@@ -233,7 +233,7 @@ struct virtio_gpu_resource_detach_backing {
 };
 
 /* VIRTIO_GPU_RESP_OK_DISPLAY_INFO */
-#define VIRTIO_GPU_MAX_SCANOUTS 32
+#define VIRTIO_GPU_MAX_SCANOUTS 16
 struct virtio_gpu_resp_display_info {
 	struct virtio_gpu_ctrl_hdr hdr;
 	struct virtio_gpu_display_one {
