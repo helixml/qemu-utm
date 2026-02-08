@@ -27,7 +27,15 @@ virtio_gpu_base_reset(VirtIOGPUBase *g)
 
     g->enable = 0;
 
+    /* Reset to only scanout 0 enabled (VM console).
+     * Without this, ENABLE_SCANOUT calls persist across guest reboots,
+     * causing drm_fb_helper to try updating 16 virtual consoles at boot
+     * which overwhelms virtio-gpu and makes the VM unresponsive. */
+    g->enabled_output_bitmask = 1;
+
     for (i = 0; i < g->conf.max_outputs; i++) {
+        g->req_state[i].width = g->conf.xres;
+        g->req_state[i].height = g->conf.yres;
         g->scanout[i].resource_id = 0;
         g->scanout[i].width = 0;
         g->scanout[i].height = 0;
@@ -80,10 +88,49 @@ static void virtio_gpu_text_update(void *opaque, console_ch_t *chardata)
 {
 }
 
-static void virtio_gpu_notify_event(VirtIOGPUBase *g, uint32_t event_type)
+void virtio_gpu_notify_event(VirtIOGPUBase *g, uint32_t event_type)
 {
     g->virtio_config.events_read |= event_type;
     virtio_notify_config(&g->parent_obj);
+}
+
+/* Helix: enable a scanout on-demand for container desktop capture.
+ * Sets the display resolution and triggers a hotplug event so the
+ * guest kernel's DRM driver sees the connector as "connected". */
+int helix_enable_scanout(void *virtio_gpu, uint32_t scanout_id,
+                         uint32_t width, uint32_t height)
+{
+    VirtIOGPUBase *g = VIRTIO_GPU_BASE(virtio_gpu);
+    if (scanout_id >= g->conf.max_outputs || scanout_id == 0) {
+        error_report("[HELIX] Invalid scanout_id %u (max=%d)\n",
+                     scanout_id, g->conf.max_outputs);
+        return -1;
+    }
+
+    g->req_state[scanout_id].width = width;
+    g->req_state[scanout_id].height = height;
+    g->enabled_output_bitmask |= (1 << scanout_id);
+    virtio_gpu_notify_event(g, VIRTIO_GPU_EVENT_DISPLAY);
+
+    error_report("[HELIX] Scanout %u enabled: %ux%u\n",
+                 scanout_id, width, height);
+    return 0;
+}
+
+int helix_disable_scanout(void *virtio_gpu, uint32_t scanout_id)
+{
+    VirtIOGPUBase *g = VIRTIO_GPU_BASE(virtio_gpu);
+    if (scanout_id >= g->conf.max_outputs || scanout_id == 0) {
+        return -1;
+    }
+
+    g->req_state[scanout_id].width = 0;
+    g->req_state[scanout_id].height = 0;
+    g->enabled_output_bitmask &= ~(1 << scanout_id);
+    virtio_gpu_notify_event(g, VIRTIO_GPU_EVENT_DISPLAY);
+
+    error_report("[HELIX] Scanout %u disabled\n", scanout_id);
+    return 0;
 }
 
 static void virtio_gpu_ui_info(void *opaque, uint32_t idx, QemuUIInfo *info)
@@ -204,8 +251,11 @@ virtio_gpu_base_device_realize(DeviceState *qdev,
 
     g->enabled_output_bitmask = 1;
 
-    g->req_state[0].width = g->conf.xres;
-    g->req_state[0].height = g->conf.yres;
+    /* Apply preferred EDID resolution to all scanouts, not just scanout 0 */
+    for (i = 0; i < g->conf.max_outputs; i++) {
+        g->req_state[i].width = g->conf.xres;
+        g->req_state[i].height = g->conf.yres;
+    }
 
     g->hw_ops = &virtio_gpu_ops;
     for (i = 0; i < g->conf.max_outputs; i++) {
@@ -305,7 +355,7 @@ QEMU_BUILD_BUG_ON(sizeof(struct virtio_gpu_transfer_to_host_2d)     != 56);
 QEMU_BUILD_BUG_ON(sizeof(struct virtio_gpu_mem_entry)               != 16);
 QEMU_BUILD_BUG_ON(sizeof(struct virtio_gpu_resource_attach_backing) != 32);
 QEMU_BUILD_BUG_ON(sizeof(struct virtio_gpu_resource_detach_backing) != 32);
-QEMU_BUILD_BUG_ON(sizeof(struct virtio_gpu_resp_display_info)       != 408);
+QEMU_BUILD_BUG_ON(sizeof(struct virtio_gpu_resp_display_info)       != 792);
 
 QEMU_BUILD_BUG_ON(sizeof(struct virtio_gpu_transfer_host_3d)        != 72);
 QEMU_BUILD_BUG_ON(sizeof(struct virtio_gpu_resource_create_3d)      != 72);

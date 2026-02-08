@@ -21,8 +21,90 @@
 #include "hw/virtio/virtio-gpu-pixman.h"
 
 #include "ui/egl-helpers.h"
+#include "ui/surface.h"
 
 #include <virglrenderer.h>
+
+#ifdef __APPLE__
+#include "helix/helix-frame-export.h"
+#include <stdarg.h>
+
+/* Log to helix debug file (accessible from macOS host) */
+static void helix_debug_log(const char *fmt, ...) {
+    FILE *f = fopen("/Users/luke/Library/Group Containers/"
+                    "WDNLXAD4W8.com.utmapp.UTM/helix-debug.log", "a");
+    if (f) {
+        va_list args;
+        va_start(args, fmt);
+        vfprintf(f, fmt, args);
+        fprintf(f, "\n");
+        va_end(args);
+        fclose(f);
+    }
+}
+
+/* Forward declaration */
+static void helix_update_scanout_displaysurface(VirtIOGPU *g,
+                                                 uint32_t scanout_id,
+                                                 uint32_t resource_id);
+/* Helix frame export: store Metal texture for zero-copy encoding */
+void helix_set_scanout_metal_texture(uint32_t scanout_id, uintptr_t metal_handle);
+
+/*
+ * Helper function for helix-frame-export to get scanout resource ID
+ * without needing to include virtio-gpu.h (which causes header conflicts)
+ */
+uint32_t virtio_gpu_get_scanout_resource_id(void *virtio_gpu, uint32_t scanout_idx)
+{
+    VirtIOGPU *g = (VirtIOGPU *)virtio_gpu;
+
+    if (scanout_idx >= VIRTIO_GPU_MAX_SCANOUTS) {
+        return 0;
+    }
+
+    return g->parent_obj.scanout[scanout_idx].resource_id;
+}
+
+/*
+ * Helper function to get DisplaySurface pixel data safely
+ * Returns true if successful, filling in width, height, stride, and data pointer
+ * This avoids exposing DisplaySurface struct to helix-frame-export.m
+ */
+bool virtio_gpu_get_scanout_surface_data(void *virtio_gpu,
+                                          uint32_t scanout_idx,
+                                          uint32_t *width,
+                                          uint32_t *height,
+                                          uint32_t *stride,
+                                          void **data)
+{
+    VirtIOGPU *g = (VirtIOGPU *)virtio_gpu;
+
+    if (scanout_idx >= VIRTIO_GPU_MAX_SCANOUTS) {
+        error_report("[HELIX] Invalid scanout_idx %u >= %d", scanout_idx, VIRTIO_GPU_MAX_SCANOUTS);
+        return false;
+    }
+
+    struct virtio_gpu_scanout *scanout = &g->parent_obj.scanout[scanout_idx];
+    DisplaySurface *ds = scanout->ds;
+
+    if (!ds) {
+        helix_debug_log("[GET_DS] No DisplaySurface for scanout %u", scanout_idx);
+        return false;
+    }
+
+    *width = surface_width(ds);
+    *height = surface_height(ds);
+    *stride = surface_stride(ds);
+    *data = surface_data(ds);
+
+    if (!*data || *width == 0 || *height == 0) {
+        error_report("[HELIX] Invalid DisplaySurface data: %p, %ux%u", *data, *width, *height);
+        return false;
+    }
+
+    return true;
+}
+#endif
 
 struct virtio_gpu_virgl_resource {
     struct virtio_gpu_simple_resource base;
@@ -388,11 +470,29 @@ static void virgl_cmd_resource_flush(VirtIOGPU *g,
     trace_virtio_gpu_cmd_res_flush(rf.resource_id,
                                    rf.r.width, rf.r.height, rf.r.x, rf.r.y);
 
+    /* Log resource_flush for debugging scanout capture */
+#ifdef __APPLE__
+    {
+        static uint64_t flush_count = 0;
+        flush_count++;
+        if (flush_count <= 10 || (flush_count % 100) == 0) {
+            helix_debug_log("[FLUSH] #%llu resource_id=%u rect=(%u,%u %ux%u)",
+                            flush_count, rf.resource_id,
+                            rf.r.x, rf.r.y, rf.r.width, rf.r.height);
+        }
+    }
+#endif
+
     for (i = 0; i < g->parent_obj.conf.max_outputs; i++) {
         if (g->parent_obj.scanout[i].resource_id != rf.resource_id) {
             continue;
         }
         virtio_gpu_rect_update(g, i, rf.r.x, rf.r.y, rf.r.width, rf.r.height);
+
+#ifdef __APPLE__
+        /* Update DisplaySurface copy for Helix frame export on damage */
+        helix_update_scanout_displaysurface(g, i, rf.resource_id);
+#endif
     }
 }
 
@@ -482,6 +582,12 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
     trace_virtio_gpu_cmd_set_scanout(ss.scanout_id, ss.resource_id,
                                      ss.r.width, ss.r.height, ss.r.x, ss.r.y);
 
+#ifdef __APPLE__
+    helix_debug_log("[SET_SCANOUT] scanout_id=%u resource_id=%u rect=(%u,%u %ux%u)",
+                    ss.scanout_id, ss.resource_id,
+                    ss.r.x, ss.r.y, ss.r.width, ss.r.height);
+#endif
+
     if (ss.scanout_id >= g->parent_obj.conf.max_outputs) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: illegal scanout id specified %d",
                       __func__, ss.scanout_id);
@@ -497,6 +603,27 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
 #else
         borrower = virgl_borrow_texture_for_scanout;
 #endif
+
+#ifdef __APPLE__
+        /* Capture Metal texture handle for helix zero-copy frame export */
+#if VIRGL_VERSION_MAJOR >= 1 && defined(VIRGL_NATIVE_HANDLE_METAL_TEXTURE)
+        {
+            struct virgl_renderer_resource_info_ext ext;
+            memset(&ext, 0, sizeof(ext));
+            if (virgl_renderer_resource_get_info_ext(ss.resource_id, &ext) == 0) {
+                if (ext.native_type == VIRGL_NATIVE_HANDLE_METAL_TEXTURE &&
+                    ext.native_handle) {
+                    helix_set_scanout_metal_texture(ss.scanout_id,
+                                                    (uintptr_t)ext.native_handle);
+                    helix_debug_log("[SET_SCANOUT] Metal texture captured: "
+                                    "scanout=%u handle=%p",
+                                    ss.scanout_id, ext.native_handle);
+                }
+            }
+        }
+#endif
+#endif
+
         qemu_console_resize(g->parent_obj.scanout[ss.scanout_id].con,
                             ss.r.width, ss.r.height);
         virgl_renderer_force_ctx_0();
@@ -509,7 +636,39 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
         dpy_gl_scanout_disable(g->parent_obj.scanout[ss.scanout_id].con);
     }
     g->parent_obj.scanout[ss.scanout_id].resource_id = ss.resource_id;
+
+#ifdef __APPLE__
+    helix_update_scanout_displaysurface(g, ss.scanout_id, ss.resource_id);
+#endif
 }
+
+#ifdef __APPLE__
+/*
+ * Update scanout's DisplaySurface from GPU resource.
+ * Triggers frame encoding. If zero-copy Metal IOSurface is available
+ * (captured at SET_SCANOUT time), helix_scanout_frame_ready uses it
+ * directly — no CPU readback needed.
+ */
+static void helix_update_scanout_displaysurface(VirtIOGPU *g,
+                                                 uint32_t scanout_id,
+                                                 uint32_t resource_id)
+{
+    if (scanout_id >= g->parent_obj.conf.max_outputs) {
+        return;
+    }
+
+    if (resource_id == 0) {
+        struct virtio_gpu_scanout *scanout = &g->parent_obj.scanout[scanout_id];
+        if (scanout->ds) {
+            qemu_free_displaysurface(scanout->ds);
+            scanout->ds = NULL;
+        }
+        return;
+    }
+
+    helix_scanout_frame_ready(g, scanout_id, resource_id);
+}
+#endif
 
 static void virgl_cmd_submit_3d(VirtIOGPU *g,
                                 struct virtio_gpu_ctrl_command *cmd)
@@ -871,6 +1030,14 @@ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
                                           ss.r.width, ss.r.height, ss.r.x,
                                           ss.r.y);
 
+#ifdef __APPLE__
+    helix_debug_log("[SET_SCANOUT_BLOB] scanout_id=%u resource_id=%u "
+                    "rect=(%u,%u %ux%u) fb=%ux%u format=%u",
+                    ss.scanout_id, ss.resource_id,
+                    ss.r.x, ss.r.y, ss.r.width, ss.r.height,
+                    ss.width, ss.height, ss.format);
+#endif
+
     if (ss.scanout_id >= g->parent_obj.conf.max_outputs) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: illegal scanout id specified %d",
                       __func__, ss.scanout_id);
@@ -924,6 +1091,10 @@ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
     }
 
     virtio_gpu_update_scanout(g, ss.scanout_id, &res->base, &fb, &ss.r);
+
+#ifdef __APPLE__
+    helix_update_scanout_displaysurface(g, ss.scanout_id, ss.resource_id);
+#endif
 }
 #endif
 
@@ -1165,6 +1336,7 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
 #ifdef VIRGL_RENDERER_D3D11_SHARE_TEXTURE
     if (qemu_egl_angle_d3d) {
         flags |= VIRGL_RENDERER_D3D11_SHARE_TEXTURE;
+        error_report("[HELIX-DEBUG] Added VIRGL_RENDERER_D3D11_SHARE_TEXTURE flag");
     }
 #endif
 #if VIRGL_VERSION_MAJOR >= 1
@@ -1173,11 +1345,22 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
     }
 #endif
 
+    error_report("[HELIX-DEBUG] About to call virgl_renderer_init with flags=0x%x", flags);
+
     ret = virgl_renderer_init(g, flags, &virtio_gpu_3d_cbs);
     if (ret != 0) {
+        error_report("[HELIX-DEBUG] virgl_renderer_init FAILED with ret=%d", ret);
         error_report("virgl could not be initialized: %d", ret);
         return ret;
     }
+
+    error_report("[HELIX-DEBUG] virgl_renderer_init succeeded");
+
+#ifdef __APPLE__
+    /* Initialize Helix frame export for zero-copy GPU frame sharing */
+    helix_frame_export_init(g, 15937); /* TCP port for frame export */
+    error_report("[HELIX-DEBUG] helix_frame_export_init returned");
+#endif
 
     gl->fence_poll = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                   virtio_gpu_fence_poll, g);

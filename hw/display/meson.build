@@ -80,6 +80,22 @@ if config_all_devices.has_key('CONFIG_VIRTIO_GPU')
     virtio_gpu_gl_ss = ss.source_set()
     virtio_gpu_gl_ss.add(when: ['CONFIG_VIRTIO_GPU', virgl, opengl],
                          if_true: [files('virtio-gpu-gl.c', 'virtio-gpu-virgl.c'), pixman, virgl])
+
+    # Add Helix frame export on macOS for zero-copy GPU frame sharing
+    if host_machine.system() == 'darwin'
+      videotoolbox = dependency('VideoToolbox', required: true)
+      corevideo = dependency('CoreVideo', required: true)
+      coremedia = dependency('CoreMedia', required: true)
+      iosurface = dependency('IOSurface', required: true)
+      metal = dependency('Metal', required: true)
+      foundation = dependency('Foundation', required: true)
+
+      virtio_gpu_gl_ss.add(when: ['CONFIG_VIRTIO_GPU', virgl, opengl],
+                           if_true: [files('helix/helix-frame-export.m'),
+                                     videotoolbox, corevideo, coremedia,
+                                     iosurface, metal, foundation])
+    endif
+
     hw_display_modules += {'virtio-gpu-gl': virtio_gpu_gl_ss}
   endif
 

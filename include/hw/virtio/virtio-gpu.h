@@ -166,7 +166,7 @@ struct VirtIOGPUBaseClass {
 };
 
 #define VIRTIO_GPU_BASE_PROPERTIES(_state, _conf)                       \
-    DEFINE_PROP_UINT32("max_outputs", _state, _conf.max_outputs, 1),    \
+    DEFINE_PROP_UINT32("max_outputs", _state, _conf.max_outputs, 16),    \
     DEFINE_PROP_BIT("edid", _state, _conf.flags, \
                     VIRTIO_GPU_FLAG_EDID_ENABLED, true), \
     DEFINE_PROP_UINT32("xres", _state, _conf.xres, 1280), \
@@ -299,6 +299,7 @@ bool virtio_gpu_base_device_realize(DeviceState *qdev,
                                     Error **errp);
 void virtio_gpu_base_device_unrealize(DeviceState *qdev);
 void virtio_gpu_base_reset(VirtIOGPUBase *g);
+void virtio_gpu_notify_event(VirtIOGPUBase *g, uint32_t event_type);
 void virtio_gpu_base_fill_display_info(VirtIOGPUBase *g,
                         struct virtio_gpu_resp_display_info *dpy_info);
 

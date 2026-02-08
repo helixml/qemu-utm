@@ -14,6 +14,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/module.h"
+#include "qemu/error-report.h"
 #include "hw/pci/pci.h"
 #include "hw/qdev-properties.h"
 #include "hw/virtio/virtio.h"
@@ -34,6 +35,9 @@ struct VirtIOGPUGLPCI {
 static void virtio_gpu_gl_initfn(Object *obj)
 {
     VirtIOGPUGLPCI *dev = VIRTIO_GPU_GL_PCI(obj);
+
+    /* Debug: Use error_report which goes to stderr/logs */
+    error_report("[HELIX-DEBUG] virtio_gpu_gl_pci initfn called");
 
     virtio_instance_init_common(obj, &dev->vdev, sizeof(dev->vdev),
                                 TYPE_VIRTIO_GPU_GL);
