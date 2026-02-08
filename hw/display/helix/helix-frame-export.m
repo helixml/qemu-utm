@@ -1742,7 +1742,8 @@ static ScanoutEncoderCtx g_scanout_ctx[HELIX_MAX_SCANOUTS];
  * Create per-scanout encoder session
  */
 static int create_scanout_encoder(HelixFrameExport *fe, uint32_t scanout_id,
-                                    int32_t width, int32_t height)
+                                    int32_t width, int32_t height,
+                                    int32_t bitrate)
 {
     if (scanout_id >= HELIX_MAX_SCANOUTS) return -1;
 
@@ -1795,8 +1796,14 @@ static int create_scanout_encoder(HelixFrameExport *fe, uint32_t scanout_id,
     VTSessionSetProperty(enc->session, kVTCompressionPropertyKey_MaxKeyFrameInterval, maxKeyFrameRef);
     CFRelease(maxKeyFrameRef);
 
-    int bitrate = 8000000;
-    CFNumberRef bitrateRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &bitrate);
+    /* Use provided bitrate, or auto-scale from resolution (~4 bits/pixel) */
+    int effective_bitrate = bitrate;
+    if (effective_bitrate <= 0) {
+        int64_t pixels = (int64_t)width * (int64_t)height;
+        effective_bitrate = (int32_t)(pixels * 4);
+        if (effective_bitrate < 5000000) effective_bitrate = 5000000;  /* 5 Mbps minimum */
+    }
+    CFNumberRef bitrateRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &effective_bitrate);
     VTSessionSetProperty(enc->session, kVTCompressionPropertyKey_AverageBitRate, bitrateRef);
     CFRelease(bitrateRef);
 
@@ -1814,9 +1821,11 @@ static int create_scanout_encoder(HelixFrameExport *fe, uint32_t scanout_id,
 
     enc->width = width;
     enc->height = height;
+    enc->bitrate = effective_bitrate;
     enc->configured = true;
 
-    helix_log("[HELIX] Created encoder for scanout %u: %dx%d", scanout_id, width, height);
+    helix_log("[HELIX] Created encoder for scanout %u: %dx%d bitrate=%d",
+              scanout_id, width, height, effective_bitrate);
     return 0;
 }
 
@@ -1897,7 +1906,10 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
     /* Create or update encoder */
     HelixScanoutEncoder *enc = &fe->scanout_encoders[scanout_id];
     if (!enc->configured || enc->width != (int32_t)width || enc->height != (int32_t)height) {
-        if (create_scanout_encoder(fe, scanout_id, width, height) != 0) {
+        /* Use existing bitrate: either from CONFIG_REQ (pre-set before first frame)
+         * or from previous encoder session (resolution change). 0 = auto-scale. */
+        int32_t prev_bitrate = enc->bitrate;
+        if (create_scanout_encoder(fe, scanout_id, width, height, prev_bitrate) != 0) {
             CFRelease(surface);
             return;
         }
@@ -2130,6 +2142,33 @@ static void *client_handler_thread(void *arg)
             pthread_mutex_lock(&fe->mutex);
             fe->vsock_fd = old_fd;
             pthread_mutex_unlock(&fe->mutex);
+
+        } else if (header.msg_type == HELIX_MSG_CONFIG_REQ) {
+            /* Per-scanout bitrate configuration from client */
+            HelixConfigRequest cfg;
+            memcpy(&cfg.header, &header, sizeof(header));
+            size_t remaining = sizeof(HelixConfigRequest) - sizeof(HelixMsgHeader);
+            if (!read_exact_bytes(client_fd, ((uint8_t *)&cfg) + sizeof(HelixMsgHeader),
+                                  remaining)) break;
+
+            /* Apply bitrate to the scanout this client is subscribed to */
+            uint32_t target_scanout = fe->clients[client_idx].subscribed_scanout;
+            int32_t new_bitrate = (int32_t)cfg.bitrate;
+
+            helix_log("[HELIX] Client %d CONFIG_REQ: scanout=%u bitrate=%d",
+                      client_idx, target_scanout, new_bitrate);
+
+            if (target_scanout < HELIX_MAX_SCANOUTS && new_bitrate > 0) {
+                HelixScanoutEncoder *enc = &fe->scanout_encoders[target_scanout];
+                if (enc->configured && enc->bitrate != new_bitrate) {
+                    /* Reconfigure encoder with new bitrate */
+                    create_scanout_encoder(fe, target_scanout,
+                                           enc->width, enc->height, new_bitrate);
+                } else if (!enc->configured) {
+                    /* Store bitrate for when encoder is created on first frame */
+                    enc->bitrate = new_bitrate;
+                }
+            }
 
         } else {
             /* Skip unknown messages */

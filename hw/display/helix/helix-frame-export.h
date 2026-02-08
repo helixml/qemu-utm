@@ -139,6 +139,7 @@ typedef struct HelixScanoutEncoder {
     VTCompressionSessionRef session;
     int32_t width;
     int32_t height;
+    int32_t bitrate;        /* Target bitrate in bps (0 = auto-scale from resolution) */
     bool configured;
     uint64_t frame_count;
 } HelixScanoutEncoder;
