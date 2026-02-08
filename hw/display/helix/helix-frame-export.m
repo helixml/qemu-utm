@@ -1975,16 +1975,89 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
             CFRelease(enc->cached_surface);
             enc->cached_surface = NULL;
         }
+        if (enc->encode_snapshot) {
+            CFRelease(enc->encode_snapshot);
+            enc->encode_snapshot = NULL;
+        }
     }
 
     IOSurfaceRef encode_surface = NULL;
 
     if (zero_copy_surface) {
         /*
-         * Zero-copy path: use the Metal texture's IOSurface directly.
-         * No CPU readback, no memcpy — GPU renders, we encode.
+         * Snapshot-on-flush: copy the Metal texture's IOSurface into a stable
+         * scratch surface before encoding. This prevents the race condition where
+         * virglrenderer writes to the IOSurface (via the Metal texture) while
+         * VideoToolbox is reading it for H.264 encoding, which causes artifacts
+         * that persist until the next keyframe.
+         *
+         * The memcpy is sub-millisecond at 1080p (~8MB) on Apple Silicon.
+         * We encode the CURRENT frame (no added latency), just from a stable copy.
          */
-        encode_surface = zero_copy_surface;
+
+        /* Create or recreate snapshot surface if dimensions changed */
+        if (enc->encode_snapshot) {
+            uint32_t snap_w = (uint32_t)IOSurfaceGetWidth(enc->encode_snapshot);
+            uint32_t snap_h = (uint32_t)IOSurfaceGetHeight(enc->encode_snapshot);
+            if (snap_w != width || snap_h != height) {
+                CFRelease(enc->encode_snapshot);
+                enc->encode_snapshot = NULL;
+            }
+        }
+        if (!enc->encode_snapshot) {
+            size_t row_bytes = width * 4;
+            CFMutableDictionaryRef props = CFDictionaryCreateMutable(
+                kCFAllocatorDefault, 0,
+                &kCFTypeDictionaryKeyCallBacks,
+                &kCFTypeDictionaryValueCallBacks);
+            CFNumberRef widthNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &width);
+            CFNumberRef heightNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &height);
+            CFNumberRef bytesPerRow = CFNumberCreate(kCFAllocatorDefault, kCFNumberLongType, &row_bytes);
+            uint32_t pixelFormat = kCVPixelFormatType_32BGRA;
+            CFNumberRef pixelFormatNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &pixelFormat);
+            CFDictionarySetValue(props, kIOSurfaceWidth, widthNum);
+            CFDictionarySetValue(props, kIOSurfaceHeight, heightNum);
+            CFDictionarySetValue(props, kIOSurfaceBytesPerRow, bytesPerRow);
+            CFDictionarySetValue(props, kIOSurfacePixelFormat, pixelFormatNum);
+            CFRelease(widthNum);
+            CFRelease(heightNum);
+            CFRelease(bytesPerRow);
+            CFRelease(pixelFormatNum);
+            enc->encode_snapshot = IOSurfaceCreate(props);
+            CFRelease(props);
+            if (!enc->encode_snapshot) {
+                return;
+            }
+            helix_log("[FRAME_READY] Created encode_snapshot IOSurface for scanout %u: %ux%u",
+                      scanout_id, width, height);
+        }
+
+        /* Copy from Metal IOSurface to snapshot surface */
+        IOSurfaceLock(zero_copy_surface, kIOSurfaceLockReadOnly, NULL);
+        IOSurfaceLock(enc->encode_snapshot, 0, NULL);
+
+        void *src = IOSurfaceGetBaseAddress(zero_copy_surface);
+        void *dst = IOSurfaceGetBaseAddress(enc->encode_snapshot);
+        size_t src_stride = IOSurfaceGetBytesPerRow(zero_copy_surface);
+        size_t dst_stride = IOSurfaceGetBytesPerRow(enc->encode_snapshot);
+        size_t copy_bytes = width * 4;
+
+        if (src_stride == dst_stride && src_stride == copy_bytes) {
+            /* Fast path: strides match, single memcpy */
+            memcpy(dst, src, copy_bytes * height);
+        } else {
+            /* Row-by-row copy if strides differ */
+            for (uint32_t row = 0; row < height; row++) {
+                memcpy((uint8_t *)dst + row * dst_stride,
+                       (uint8_t *)src + row * src_stride,
+                       copy_bytes);
+            }
+        }
+
+        IOSurfaceUnlock(enc->encode_snapshot, 0, NULL);
+        IOSurfaceUnlock(zero_copy_surface, kIOSurfaceLockReadOnly, NULL);
+
+        encode_surface = enc->encode_snapshot;
         IOSurfaceIncrementUseCount(encode_surface);
     } else {
         /*
@@ -2414,6 +2487,7 @@ int helix_frame_export_init(void *virtio_gpu, int vsock_port)
         fe->scanout_encoders[i].session = NULL;
         fe->scanout_encoders[i].configured = false;
         fe->scanout_encoders[i].cached_surface = NULL;
+        fe->scanout_encoders[i].encode_snapshot = NULL;
         fe->scanout_encoders[i].metal_texture = NULL;
         fe->scanout_encoders[i].metal_iosurface = NULL;
     }

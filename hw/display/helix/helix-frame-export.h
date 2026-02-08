@@ -145,6 +145,9 @@ typedef struct HelixScanoutEncoder {
     IOSurfaceRef cached_surface;    /* Reusable IOSurface for CPU fallback path */
     void *metal_texture;            /* MTLTexture* captured at SET_SCANOUT (retained) */
     IOSurfaceRef metal_iosurface;   /* IOSurface backing the Metal texture (not retained) */
+    IOSurfaceRef encode_snapshot;   /* Snapshot surface for zero-copy path: copied from
+                                     * metal_iosurface on each flush to avoid race between
+                                     * virglrenderer writing and VideoToolbox reading */
 } HelixScanoutEncoder;
 
 /*
