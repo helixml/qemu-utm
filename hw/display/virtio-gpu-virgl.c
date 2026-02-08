@@ -29,6 +29,19 @@
 #ifdef __APPLE__
 #include "helix/helix-frame-export.h"
 
+static void helix_virgl_log(const char *fmt, ...) {
+    FILE *f = fopen("/Users/luke/Library/Group Containers/"
+                    "WDNLXAD4W8.com.utmapp.UTM/helix-debug.log", "a");
+    if (f) {
+        va_list args;
+        va_start(args, fmt);
+        vfprintf(f, fmt, args);
+        fprintf(f, "\n");
+        va_end(args);
+        fclose(f);
+    }
+}
+
 /* Forward declaration */
 static void helix_update_scanout_displaysurface(VirtIOGPU *g,
                                                  uint32_t scanout_id,
@@ -499,9 +512,38 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
         return;
     }
 
-    /* Skip GL scanout setup for non-GL consoles (secondary 2D consoles) */
+    /* For non-GL consoles: still capture Metal texture for helix frame export,
+     * but skip the full GL scanout setup (avoids gl_draw_done deadlock). */
     if (!console_has_gl(g->parent_obj.scanout[ss.scanout_id].con)) {
         g->parent_obj.scanout[ss.scanout_id].resource_id = ss.resource_id;
+#if defined(__APPLE__) && defined(CONFIG_METAL) && VIRGL_VERSION_MAJOR >= 1
+        /* Extract Metal texture for helix zero-copy encoding.
+         * resource_get_info_ext returns native_type=NONE for non-blob resources,
+         * so we use create_handle_for_scanout which always works. */
+        if (ss.resource_id && ss.r.width && ss.r.height) {
+            struct virgl_renderer_resource_info_ext hext;
+            memset(&hext, 0, sizeof(hext));
+            int hret = virgl_renderer_resource_get_info_ext(ss.resource_id, &hext);
+            if (hret == 0) {
+                enum virgl_renderer_native_handle_type ntype;
+                virgl_renderer_native_handle nhandle = NULL;
+                ntype = virgl_renderer_create_handle_for_scanout(
+                    ss.resource_id, ss.r.width, ss.r.height,
+                    hext.base.virgl_format, 0, hext.base.stride, 0, &nhandle);
+                helix_virgl_log("[SET_SCANOUT non-GL] scanout=%u res=%u %ux%u "
+                        "create_handle type=%d handle=%p",
+                        ss.scanout_id, ss.resource_id, ss.r.width, ss.r.height,
+                        (int)ntype, nhandle);
+                if (ntype == VIRGL_NATIVE_HANDLE_METAL_TEXTURE && nhandle) {
+                    helix_set_scanout_metal_texture(ss.scanout_id, (uintptr_t)nhandle);
+                    /* Don't release — helix_set_scanout_metal_texture retains it.
+                     * It will be released when the next SET_SCANOUT replaces it. */
+                } else if (ntype != VIRGL_NATIVE_HANDLE_NONE && nhandle) {
+                    virgl_renderer_release_handle_for_scanout(ntype, nhandle);
+                }
+            }
+        }
+#endif
         return;
     }
 
@@ -523,6 +565,10 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
             .handle = ext.d3d_tex2d,
         };
 #if VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION >= NATIVE_HANDLE_SUPPORT_VERSION
+        helix_virgl_log("[SET_SCANOUT GL] scanout=%u res=%u ext.version=%u "
+                "native_type=%d native_handle=%p",
+                ss.scanout_id, ss.resource_id, ext.version,
+                (int)ext.native_type, (void *)ext.native_handle);
         if (ext.version >= VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION) {
             switch (ext.native_type) {
 #ifdef CONFIG_METAL
@@ -534,7 +580,30 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
                 break;
             }
 #endif
-            case VIRGL_NATIVE_HANDLE_NONE:
+            case VIRGL_NATIVE_HANDLE_NONE: {
+#ifdef CONFIG_METAL
+                /* resource_get_info_ext returns NONE for non-blob resources.
+                 * Use create_handle_for_scanout to get Metal texture instead. */
+                {
+                    virgl_renderer_native_handle nhandle = NULL;
+                    enum virgl_renderer_native_handle_type ntype;
+                    ntype = virgl_renderer_create_handle_for_scanout(
+                        ss.resource_id, ss.r.width, ss.r.height,
+                        ext.base.virgl_format, 0, ext.base.stride, 0, &nhandle);
+                    helix_virgl_log("[SET_SCANOUT GL fallback] scanout=%u res=%u "
+                            "create_handle type=%d handle=%p",
+                            ss.scanout_id, ss.resource_id, (int)ntype, nhandle);
+                    if (ntype == VIRGL_NATIVE_HANDLE_METAL_TEXTURE && nhandle) {
+                        native.type = SCANOUT_TEXTURE_NATIVE_TYPE_METAL;
+                        native.handle = nhandle;
+                        helix_set_scanout_metal_texture(ss.scanout_id, (uintptr_t)nhandle);
+                    } else if (ntype != VIRGL_NATIVE_HANDLE_NONE && nhandle) {
+                        virgl_renderer_release_handle_for_scanout(ntype, nhandle);
+                    }
+                }
+#endif
+                break;
+            }
             case VIRGL_NATIVE_HANDLE_D3D_TEX2D: {
                 /* already handled above */
                 break;
@@ -1033,9 +1102,26 @@ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
         return;
     }
 
-    /* Skip GL scanout setup for non-GL consoles (secondary 2D consoles) */
+    /* For non-GL consoles: still try to capture Metal texture for helix,
+     * but skip the full GL scanout setup (avoids gl_draw_done deadlock). */
     if (!console_has_gl(g->parent_obj.scanout[ss.scanout_id].con)) {
         g->parent_obj.scanout[ss.scanout_id].resource_id = ss.resource_id;
+#if defined(__APPLE__) && defined(CONFIG_METAL) && defined(HAVE_VIRGL_RENDERER_NATIVE_SCANOUT)
+        /* Try to get Metal texture via native blob handle for helix zero-copy */
+        if (ss.resource_id) {
+            enum virgl_renderer_native_handle_type ntype;
+            virgl_renderer_native_handle nhandle;
+            ntype = virgl_renderer_create_handle_for_scanout(ss.resource_id,
+                ss.width, ss.height, ss.format, ss.padding,
+                ss.strides[0], ss.offsets[0], &nhandle);
+            if (ntype == VIRGL_NATIVE_HANDLE_METAL_TEXTURE) {
+                helix_set_scanout_metal_texture(ss.scanout_id, (uintptr_t)nhandle);
+                /* Don't release — helix retains the texture */
+            } else if (ntype != VIRGL_NATIVE_HANDLE_NONE) {
+                virgl_renderer_release_handle_for_scanout(ntype, nhandle);
+            }
+        }
+#endif
         return;
     }
 
