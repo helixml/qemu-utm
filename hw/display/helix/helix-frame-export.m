@@ -39,6 +39,14 @@ int helix_disable_scanout(void *virtio_gpu, uint32_t scanout_id);
 #include <epoxy/egl.h>
 #include <OpenGL/OpenGL.h>  /* CGLContextObj for CGL detection */
 
+/* ANGLE IOSurface extension constants not in epoxy's generated headers */
+#ifndef EGL_IOSURFACE_READ_HINT_ANGLE
+#define EGL_IOSURFACE_READ_HINT_ANGLE 0x0001
+#endif
+#ifndef EGL_IOSURFACE_WRITE_HINT_ANGLE
+#define EGL_IOSURFACE_WRITE_HINT_ANGLE 0x0002
+#endif
+
 /* QEMU EGL globals (defined in ui/egl-helpers.c) */
 extern EGLDisplay *qemu_egl_display;
 extern EGLConfig qemu_egl_config;
