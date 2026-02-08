@@ -1914,7 +1914,12 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
 
     /* Try zero-copy: Metal texture → IOSurface → VideoToolbox */
     IOSurfaceRef zero_copy_surface = NULL;
-#if VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION >= 2
+#if VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION >= 1
+    if (ready_count <= 5) {
+        helix_log("[FRAME_READY] resource %u: native_type=%d native_handle=%p version=%d",
+                  res_id, info_ext.native_type, (void *)info_ext.native_handle,
+                  info_ext.version);
+    }
     if (info_ext.native_type == VIRGL_NATIVE_HANDLE_METAL_TEXTURE &&
         info_ext.native_handle != 0) {
         id<MTLTexture> mtl_texture = (__bridge id<MTLTexture>)(void *)info_ext.native_handle;
@@ -1924,7 +1929,13 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
                 helix_log("[FRAME_READY] Zero-copy: Metal texture %p → IOSurface %p (%ux%u)",
                           (__bridge void *)mtl_texture, zero_copy_surface, width, height);
             }
+        } else if (ready_count <= 5) {
+            helix_log("[FRAME_READY] Metal texture %p has no IOSurface backing",
+                      mtl_texture ? (__bridge void *)mtl_texture : NULL);
         }
+    } else if (ready_count <= 5) {
+        helix_log("[FRAME_READY] No Metal texture (native_type=%d), using CPU fallback",
+                  info_ext.native_type);
     }
 #endif
 
