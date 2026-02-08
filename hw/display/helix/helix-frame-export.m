@@ -2466,10 +2466,46 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
         IOSurfaceIncrementUseCount(encode_surface);
     }
 
-    /* Create CVPixelBuffer from IOSurface (wraps existing surface, no pixel copy) */
+    /*
+     * Create a per-frame CVPixelBuffer with its own IOSurface backing.
+     * CRITICAL: We must NOT wrap encode_surface directly because
+     * VTCompressionSessionEncodeFrame is asynchronous — VideoToolbox may still
+     * be reading from the surface when the next frame's GPU blit/memcpy
+     * overwrites it. Instead, copy into a fresh CVPixelBuffer that VT owns
+     * exclusively. On Apple Silicon unified memory, this memcpy is sub-ms
+     * even at 5K (59MB @ 100+ GB/s bandwidth).
+     */
+    NSDictionary *pbAttrs = @{
+        (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{}
+    };
     CVPixelBufferRef pixelBuffer = NULL;
-    CVReturn cvRet = CVPixelBufferCreateWithIOSurface(
-        kCFAllocatorDefault, encode_surface, NULL, &pixelBuffer);
+    CVReturn cvRet = CVPixelBufferCreate(
+        kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA,
+        (__bridge CFDictionaryRef)pbAttrs, &pixelBuffer);
+
+    if (cvRet == kCVReturnSuccess && pixelBuffer) {
+        CVPixelBufferLockBaseAddress(pixelBuffer, 0);
+        IOSurfaceLock(encode_surface, kIOSurfaceLockReadOnly, NULL);
+
+        void *src = IOSurfaceGetBaseAddress(encode_surface);
+        void *dst = CVPixelBufferGetBaseAddress(pixelBuffer);
+        size_t src_stride = IOSurfaceGetBytesPerRow(encode_surface);
+        size_t dst_stride = CVPixelBufferGetBytesPerRow(pixelBuffer);
+
+        if (src_stride == dst_stride) {
+            memcpy(dst, src, dst_stride * height);
+        } else {
+            size_t copy_bytes = (size_t)width * 4;
+            for (uint32_t row = 0; row < height; row++) {
+                memcpy((uint8_t *)dst + row * dst_stride,
+                       (uint8_t *)src + row * src_stride,
+                       copy_bytes);
+            }
+        }
+
+        IOSurfaceUnlock(encode_surface, kIOSurfaceLockReadOnly, NULL);
+        CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
+    }
 
     IOSurfaceDecrementUseCount(encode_surface);
 
