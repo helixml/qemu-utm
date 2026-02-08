@@ -1886,10 +1886,13 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
     }
 
     /*
-     * Get the resource ID for this scanout, then read pixels directly from the
-     * GPU resource into our cached IOSurface. This avoids the triple-copy:
-     *   OLD: GPU → temp buffer → DisplaySurface → IOSurface (3x 59MB at 5K)
-     *   NEW: GPU → IOSurface (1x 59MB at 5K)
+     * Zero-copy path: get the Metal texture backing the scanout's GPU resource,
+     * extract its IOSurface, and pass directly to VideoToolbox.
+     *
+     * This mirrors how SPICE displays the scanout (via ScanoutTextureNative.handle)
+     * but feeds it to H.264 encoding instead of display.
+     *
+     * Fallback: CPU readback via virgl_renderer_transfer_read_iov into cached IOSurface.
      */
     uint32_t res_id = virtio_gpu_get_scanout_resource_id(virtio_gpu, scanout_id);
     if (res_id == 0) {
@@ -1904,90 +1907,111 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
 
     uint32_t width = info_ext.base.width;
     uint32_t height = info_ext.base.height;
-    uint32_t stride = info_ext.base.stride;
 
     if (width == 0 || height == 0) {
         return;
     }
 
+    /* Try zero-copy: Metal texture → IOSurface → VideoToolbox */
+    IOSurfaceRef zero_copy_surface = NULL;
+#if VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION >= 2
+    if (info_ext.native_type == VIRGL_NATIVE_HANDLE_METAL_TEXTURE &&
+        info_ext.native_handle != 0) {
+        id<MTLTexture> mtl_texture = (__bridge id<MTLTexture>)(void *)info_ext.native_handle;
+        if (mtl_texture && mtl_texture.iosurface) {
+            zero_copy_surface = mtl_texture.iosurface;
+            if (ready_count <= 5 || (ready_count % 300) == 0) {
+                helix_log("[FRAME_READY] Zero-copy: Metal texture %p → IOSurface %p (%ux%u)",
+                          (__bridge void *)mtl_texture, zero_copy_surface, width, height);
+            }
+        }
+    }
+#endif
+
     /* Create or update encoder */
     HelixScanoutEncoder *enc = &fe->scanout_encoders[scanout_id];
     if (!enc->configured || enc->width != (int32_t)width || enc->height != (int32_t)height) {
-        /* Use existing bitrate: either from CONFIG_REQ (pre-set before first frame)
-         * or from previous encoder session (resolution change). 0 = auto-scale. */
         int32_t prev_bitrate = enc->bitrate;
         if (create_scanout_encoder(fe, scanout_id, width, height, prev_bitrate) != 0) {
             return;
         }
-        /* Invalidate cached IOSurface on resolution change */
         if (enc->cached_surface) {
             CFRelease(enc->cached_surface);
             enc->cached_surface = NULL;
         }
     }
 
-    /* Get or create cached IOSurface for this scanout (avoid alloc/free per frame) */
-    if (!enc->cached_surface) {
-        size_t bytes_per_pixel = 4;
-        size_t row_bytes = width * bytes_per_pixel;
-        CFMutableDictionaryRef props = CFDictionaryCreateMutable(
-            kCFAllocatorDefault, 0,
-            &kCFTypeDictionaryKeyCallBacks,
-            &kCFTypeDictionaryValueCallBacks);
-        CFNumberRef widthNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &width);
-        CFNumberRef heightNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &height);
-        CFNumberRef bytesPerRow = CFNumberCreate(kCFAllocatorDefault, kCFNumberLongType, &row_bytes);
-        uint32_t pixelFormat = kCVPixelFormatType_32BGRA;
-        CFNumberRef pixelFormatNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &pixelFormat);
-        CFDictionarySetValue(props, kIOSurfaceWidth, widthNum);
-        CFDictionarySetValue(props, kIOSurfaceHeight, heightNum);
-        CFDictionarySetValue(props, kIOSurfaceBytesPerRow, bytesPerRow);
-        CFDictionarySetValue(props, kIOSurfacePixelFormat, pixelFormatNum);
-        CFRelease(widthNum);
-        CFRelease(heightNum);
-        CFRelease(bytesPerRow);
-        CFRelease(pixelFormatNum);
-        enc->cached_surface = IOSurfaceCreate(props);
-        CFRelease(props);
+    IOSurfaceRef encode_surface = NULL;
+
+    if (zero_copy_surface) {
+        /*
+         * Zero-copy path: use the Metal texture's IOSurface directly.
+         * No CPU readback, no memcpy — GPU renders, we encode.
+         */
+        encode_surface = zero_copy_surface;
+        IOSurfaceIncrementUseCount(encode_surface);
+    } else {
+        /*
+         * Fallback: CPU readback into cached IOSurface.
+         * This path is used when virglrenderer doesn't expose Metal textures.
+         */
+        uint32_t stride = info_ext.base.stride;
+
         if (!enc->cached_surface) {
-            helix_log("[FRAME_READY] Failed to create cached IOSurface for scanout %u", scanout_id);
+            size_t row_bytes = width * 4;
+            CFMutableDictionaryRef props = CFDictionaryCreateMutable(
+                kCFAllocatorDefault, 0,
+                &kCFTypeDictionaryKeyCallBacks,
+                &kCFTypeDictionaryValueCallBacks);
+            CFNumberRef widthNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &width);
+            CFNumberRef heightNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &height);
+            CFNumberRef bytesPerRow = CFNumberCreate(kCFAllocatorDefault, kCFNumberLongType, &row_bytes);
+            uint32_t pixelFormat = kCVPixelFormatType_32BGRA;
+            CFNumberRef pixelFormatNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &pixelFormat);
+            CFDictionarySetValue(props, kIOSurfaceWidth, widthNum);
+            CFDictionarySetValue(props, kIOSurfaceHeight, heightNum);
+            CFDictionarySetValue(props, kIOSurfaceBytesPerRow, bytesPerRow);
+            CFDictionarySetValue(props, kIOSurfacePixelFormat, pixelFormatNum);
+            CFRelease(widthNum);
+            CFRelease(heightNum);
+            CFRelease(bytesPerRow);
+            CFRelease(pixelFormatNum);
+            enc->cached_surface = IOSurfaceCreate(props);
+            CFRelease(props);
+            if (!enc->cached_surface) {
+                return;
+            }
+            helix_log("[FRAME_READY] CPU fallback: created cached IOSurface for scanout %u: %ux%u",
+                      scanout_id, width, height);
+        }
+
+        IOSurfaceLock(enc->cached_surface, 0, NULL);
+        void *surface_base = IOSurfaceGetBaseAddress(enc->cached_surface);
+        size_t row_bytes = width * 4;
+        size_t buffer_size = row_bytes * height;
+
+        struct iovec iov = { .iov_base = surface_base, .iov_len = buffer_size };
+        struct { uint32_t x, y, z, w, h, d; } box = { 0, 0, 0, width, height, 1 };
+
+        virgl_renderer_force_ctx_0();
+        ret = virgl_renderer_transfer_read_iov(
+            res_id, 0, 0, (uint32_t)row_bytes, 0,
+            (struct virgl_box *)&box, 0, &iov, 1);
+        IOSurfaceUnlock(enc->cached_surface, 0, NULL);
+
+        if (ret != 0) {
             return;
         }
-        helix_log("[FRAME_READY] Created cached IOSurface for scanout %u: %ux%u", scanout_id, width, height);
+        encode_surface = enc->cached_surface;
+        IOSurfaceIncrementUseCount(encode_surface);
     }
 
-    /* Read GPU resource pixels directly into cached IOSurface (single copy) */
-    IOSurfaceLock(enc->cached_surface, 0, NULL);
-    void *surface_base = IOSurfaceGetBaseAddress(enc->cached_surface);
-    size_t row_bytes = width * 4;
-    size_t buffer_size = row_bytes * height;
-
-    struct iovec iov = {
-        .iov_base = surface_base,
-        .iov_len = buffer_size
-    };
-    struct {
-        uint32_t x, y, z, w, h, d;
-    } box = { 0, 0, 0, width, height, 1 };
-
-    virgl_renderer_force_ctx_0();
-    ret = virgl_renderer_transfer_read_iov(
-        res_id, 0, 0, (uint32_t)row_bytes, 0,
-        (struct virgl_box *)&box, 0, &iov, 1);
-
-    IOSurfaceUnlock(enc->cached_surface, 0, NULL);
-
-    if (ret != 0) {
-        if (ready_count <= 5 || (ready_count % 100) == 0) {
-            helix_log("[FRAME_READY] transfer_read_iov failed for scanout %u: %d", scanout_id, ret);
-        }
-        return;
-    }
-
-    /* Create CVPixelBuffer from cached IOSurface (wraps existing surface, no copy) */
+    /* Create CVPixelBuffer from IOSurface (wraps existing surface, no pixel copy) */
     CVPixelBufferRef pixelBuffer = NULL;
     CVReturn cvRet = CVPixelBufferCreateWithIOSurface(
-        kCFAllocatorDefault, enc->cached_surface, NULL, &pixelBuffer);
+        kCFAllocatorDefault, encode_surface, NULL, &pixelBuffer);
+
+    IOSurfaceDecrementUseCount(encode_surface);
 
     if (cvRet != kCVReturnSuccess || !pixelBuffer) {
         return;
