@@ -202,6 +202,10 @@ int virtio_gpu_update_dmabuf(VirtIOGPU *g,
     VGPUDMABuf *new_primary, *old_primary = NULL;
     uint32_t width, height;
 
+    if (!scanout->con) {
+        return -EINVAL;
+    }
+
     new_primary = virtio_gpu_create_dmabuf(g, scanout_id, res, fb, r);
     if (!new_primary) {
         return -EINVAL;

@@ -376,7 +376,9 @@ void virtio_gpu_disable_scanout(VirtIOGPU *g, int scanout_id)
         res->scanout_bitmask &= ~(1 << scanout_id);
     }
 
-    dpy_gfx_replace_surface(scanout->con, NULL);
+    if (scanout->con) {
+        dpy_gfx_replace_surface(scanout->con, NULL);
+    }
     scanout->resource_id = 0;
     scanout->ds = NULL;
     scanout->width = 0;
@@ -561,6 +563,9 @@ static void virtio_gpu_resource_flush(VirtIOGPU *g,
             continue;
         }
         scanout = &g->parent_obj.scanout[i];
+        if (!scanout->con) {
+            continue;
+        }
 
         qemu_rect_init(&rect, scanout->x, scanout->y,
                        scanout->width, scanout->height);
@@ -699,6 +704,11 @@ static void virtio_gpu_set_scanout(VirtIOGPU *g,
         return;
     }
 
+    if (!g->parent_obj.scanout[ss.scanout_id].con) {
+        /* Console not yet created (lazy init). Skip scanout setup. */
+        return;
+    }
+
     if (ss.resource_id == 0) {
         virtio_gpu_disable_scanout(g, ss.scanout_id);
         return;
@@ -773,6 +783,11 @@ static void virtio_gpu_set_scanout_blob(VirtIOGPU *g,
         qemu_log_mask(LOG_GUEST_ERROR, "%s: illegal scanout id specified %d",
                       __func__, ss.scanout_id);
         cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID;
+        return;
+    }
+
+    if (!g->parent_obj.scanout[ss.scanout_id].con) {
+        /* Console not yet created (lazy init). Skip scanout setup. */
         return;
     }
 
@@ -1564,7 +1579,9 @@ static void virtio_gpu_reset_bh(void *opaque)
     }
 
     for (i = 0; i < g->parent_obj.conf.max_outputs; i++) {
-        dpy_gfx_replace_surface(g->parent_obj.scanout[i].con, NULL);
+        if (g->parent_obj.scanout[i].con) {
+            dpy_gfx_replace_surface(g->parent_obj.scanout[i].con, NULL);
+        }
     }
 
     g->reset_finished = true;

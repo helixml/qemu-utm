@@ -123,42 +123,41 @@ static void virtio_gpu_gl_device_realize(DeviceState *qdev, Error **errp)
     ERRP_GUARD();
     VirtIOGPU *g = VIRTIO_GPU(qdev);
 
-    /* Debug: Mark that device realize was called */
-    error_report("[HELIX-DEBUG] virtio_gpu_gl_device_realize called");
+    /* Debug: file log to track realize progress (UTM captures stderr) */
+    {
+        FILE *f = fopen("/tmp/qemu-helix-realize.log", "a");
+        if (f) {
+            fprintf(f, "[HELIX] realize: START\n");
+            fclose(f);
+        }
+    }
 
 #if HOST_BIG_ENDIAN
     error_setg(errp, "virgl is not supported on bigendian platforms");
-    FILE *f2 = fopen("/tmp/qemu-gl-bigendian-fail.txt", "w");
-    if (f2) {
-        fprintf(f2, "Failed: bigendian\n");
-        fclose(f2);
-    }
     return;
 #endif
 
     if (!object_resolve_path_type("", TYPE_VIRTIO_GPU_GL, NULL)) {
         error_setg(errp, "at most one %s device is permitted", TYPE_VIRTIO_GPU_GL);
-        FILE *f2 = fopen("/tmp/qemu-gl-already-exists.txt", "w");
-        if (f2) {
-            fprintf(f2, "Failed: already exists\n");
-            fclose(f2);
-        }
         return;
     }
 
     if (!display_opengl) {
         error_setg(errp,
                    "The display backend does not have OpenGL support enabled");
-        FILE *f2 = fopen("/tmp/qemu-gl-no-opengl.txt", "w");
-        if (f2) {
-            fprintf(f2, "Failed: display_opengl is false\n");
-            fclose(f2);
-        }
         error_append_hint(errp,
                           "It can be enabled with '-display BACKEND,gl=on' "
                           "where BACKEND is the name of the display backend "
                           "to use.\n");
         return;
+    }
+
+    {
+        FILE *f = fopen("/tmp/qemu-helix-realize.log", "a");
+        if (f) {
+            fprintf(f, "[HELIX] realize: checks passed, calling virtio_gpu_device_realize\n");
+            fclose(f);
+        }
     }
 
     g->parent_obj.conf.flags |= (1 << VIRTIO_GPU_FLAG_VIRGL_ENABLED);
@@ -170,6 +169,15 @@ static void virtio_gpu_gl_device_realize(DeviceState *qdev, Error **errp)
 #endif
 
     virtio_gpu_device_realize(qdev, errp);
+
+    {
+        FILE *f = fopen("/tmp/qemu-helix-realize.log", "a");
+        if (f) {
+            fprintf(f, "[HELIX] realize: DONE (errp=%p, *errp=%p)\n",
+                    (void *)errp, errp ? (void *)*errp : NULL);
+            fclose(f);
+        }
+    }
 }
 
 static const Property virtio_gpu_gl_properties[] = {

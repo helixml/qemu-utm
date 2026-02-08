@@ -1185,7 +1185,7 @@ static void qemu_spice_gl_block(SimpleSpiceDisplay *ssd, bool block)
 
     if (block) {
         timeout = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
-        timeout += 1000; /* one sec */
+        timeout += 1000;
         timer_mod(ssd->gl_unblock_timer, timeout);
     } else {
         timer_del(ssd->gl_unblock_timer);
@@ -1202,7 +1202,9 @@ static void qemu_spice_gl_unblock_bh(void *opaque)
 
 static void qemu_spice_gl_block_timer(void *opaque)
 {
-    warn_report("spice: no gl-draw-done within one second");
+    /* gl_draw_done callback never arrived from the SPICE client.
+     * Just log — don't unblock, as that causes a double-unblock race
+     * if gl_draw_done arrives late (con->gl_block goes negative). */
 }
 
 static int qemu_spice_gl_make_context_current(DisplayGLCtx *dgc,
@@ -1763,6 +1765,17 @@ void qemu_spice_display_init(void)
         if (spice_con != NULL && spice_con != con) {
             continue;
         }
+#ifdef HAVE_SPICE_GL
+        /* In GL mode, only create a SPICE display channel for the first
+         * console (scanout 0). UTM's SPICE client can't handle multiple
+         * GL display channels — gl_draw_done callbacks stop firing,
+         * permanently blocking virtio-gpu command processing.
+         * Secondary consoles exist for internal scanout tracking but
+         * don't need SPICE channels. */
+        if (spice_opengl != DISPLAY_GL_MODE_OFF && i > 0) {
+            continue;
+        }
+#endif
         qemu_spice_display_init_one(con);
     }
 

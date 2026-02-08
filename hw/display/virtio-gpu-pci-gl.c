@@ -36,8 +36,7 @@ static void virtio_gpu_gl_initfn(Object *obj)
 {
     VirtIOGPUGLPCI *dev = VIRTIO_GPU_GL_PCI(obj);
 
-    /* Debug: Use error_report which goes to stderr/logs */
-    error_report("[HELIX-DEBUG] virtio_gpu_gl_pci initfn called");
+    /* Debug: file log (not error_report, UTM captures stderr as errors) */
 
     virtio_instance_init_common(obj, &dev->vdev, sizeof(dev->vdev),
                                 TYPE_VIRTIO_GPU_GL);

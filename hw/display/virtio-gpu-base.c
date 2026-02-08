@@ -110,6 +110,15 @@ int helix_enable_scanout(void *virtio_gpu, uint32_t scanout_id,
     g->req_state[scanout_id].width = width;
     g->req_state[scanout_id].height = height;
     g->enabled_output_bitmask |= (1 << scanout_id);
+
+    /* Lazily create graphic console for this scanout if it doesn't exist yet.
+     * We only create console 0 at device realize time to avoid a deadlock
+     * with SPICE GL displays (see virtio_gpu_base_device_realize). */
+    if (!g->scanout[scanout_id].con) {
+        g->scanout[scanout_id].con =
+            graphic_console_init(DEVICE(g), scanout_id, g->hw_ops, g);
+    }
+
     virtio_gpu_notify_event(g, VIRTIO_GPU_EVENT_DISPLAY);
 
     error_report("[HELIX] Scanout %u enabled: %ux%u\n",
@@ -214,6 +223,25 @@ static const GraphicHwOps virtio_gpu_ops = {
     .gl_block = virtio_gpu_gl_block,
 };
 
+/* Secondary scanout ops: returns no GL/DMABUF flags, forcing SPICE to
+ * use a 2D display listener for these consoles. This prevents UTM's
+ * broken gl_draw_done handling from affecting the shared renderer_blocked
+ * counter (2D SPICE path doesn't use gl_draw_async at all). */
+static int
+virtio_gpu_get_flags_no_gl(void *opaque)
+{
+    return GRAPHIC_FLAGS_NONE;
+}
+
+static const GraphicHwOps virtio_gpu_secondary_ops = {
+    .get_flags = virtio_gpu_get_flags_no_gl,
+    .invalidate = virtio_gpu_invalidate_display,
+    .gfx_update = virtio_gpu_update_display,
+    .text_update = virtio_gpu_text_update,
+    .ui_info = virtio_gpu_ui_info,
+    .gl_block = virtio_gpu_gl_block,
+};
+
 bool
 virtio_gpu_base_device_realize(DeviceState *qdev,
                                VirtIOHandleOutput ctrl_cb,
@@ -258,9 +286,17 @@ virtio_gpu_base_device_realize(DeviceState *qdev,
     }
 
     g->hw_ops = &virtio_gpu_ops;
-    for (i = 0; i < g->conf.max_outputs; i++) {
+
+    /* Console 0 gets GL-capable ops for the primary SPICE GL display.
+     * Secondary consoles get ops that report no GL flags, forcing SPICE
+     * to use a 2D display listener. This avoids the gl_draw_done deadlock
+     * where UTM never fires gl_draw_done for secondary SPICE GL channels,
+     * permanently blocking renderer_blocked. */
+    g->scanout[0].con =
+        graphic_console_init(DEVICE(g), 0, &virtio_gpu_ops, g);
+    for (i = 1; i < g->conf.max_outputs; i++) {
         g->scanout[i].con =
-            graphic_console_init(DEVICE(g), i, &virtio_gpu_ops, g);
+            graphic_console_init(DEVICE(g), i, &virtio_gpu_secondary_ops, g);
     }
 
     return true;
