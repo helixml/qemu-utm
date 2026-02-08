@@ -48,6 +48,8 @@ static void helix_debug_log(const char *fmt, ...) {
 static void helix_update_scanout_displaysurface(VirtIOGPU *g,
                                                  uint32_t scanout_id,
                                                  uint32_t resource_id);
+/* Helix frame export: store Metal texture for zero-copy encoding */
+void helix_set_scanout_metal_texture(uint32_t scanout_id, uintptr_t metal_handle);
 
 /*
  * Helper function for helix-frame-export to get scanout resource ID
@@ -551,6 +553,8 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
             case VIRGL_NATIVE_HANDLE_METAL_TEXTURE: {
                 native.type = SCANOUT_TEXTURE_NATIVE_TYPE_METAL;
                 native.handle = ext.native_handle;
+                /* Store Metal texture for helix frame export (zero-copy encoding) */
+                helix_set_scanout_metal_texture(ss.scanout_id, (uintptr_t)ext.native_handle);
                 break;
             }
 #endif

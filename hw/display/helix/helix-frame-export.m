@@ -1739,6 +1739,47 @@ static void scanout_encoder_callback(void *outputCallbackRefCon,
 static ScanoutEncoderCtx g_scanout_ctx[HELIX_MAX_SCANOUTS];
 
 /*
+ * Called from virtio-gpu-virgl.c during SET_SCANOUT_BLOB when virglrenderer
+ * provides a Metal texture handle. This is the same point where SPICE captures
+ * the Metal texture for display. We store it for zero-copy VideoToolbox encoding.
+ */
+void helix_set_scanout_metal_texture(uint32_t scanout_id, uintptr_t metal_handle)
+{
+    HelixFrameExport *fe = g_helix_export;
+    if (!fe || !fe->valid || scanout_id >= HELIX_MAX_SCANOUTS) {
+        return;
+    }
+
+    HelixScanoutEncoder *enc = &fe->scanout_encoders[scanout_id];
+
+    /* Release previous Metal texture reference */
+    if (enc->metal_texture) {
+        CFRelease((__bridge_transfer id)(enc->metal_texture));
+        enc->metal_texture = NULL;
+        enc->metal_iosurface = NULL;
+    }
+
+    if (metal_handle == 0) {
+        return;
+    }
+
+    /* Retain the Metal texture and extract its IOSurface */
+    id<MTLTexture> tex = (__bridge id<MTLTexture>)(void *)metal_handle;
+    IOSurfaceRef surface = tex.iosurface;
+
+    if (surface) {
+        enc->metal_texture = (__bridge_retained void *)tex;
+        enc->metal_iosurface = surface;  /* IOSurface lifetime tied to texture */
+        helix_log("[HELIX] Scanout %u: captured Metal texture %p → IOSurface %p (%lux%lu)",
+                  scanout_id, (void *)metal_handle, surface,
+                  IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface));
+    } else {
+        helix_log("[HELIX] Scanout %u: Metal texture %p has NO IOSurface backing",
+                  scanout_id, (void *)metal_handle);
+    }
+}
+
+/*
  * Create per-scanout encoder session
  */
 static int create_scanout_encoder(HelixFrameExport *fe, uint32_t scanout_id,
@@ -1912,32 +1953,16 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
         return;
     }
 
-    /* Try zero-copy: Metal texture → IOSurface → VideoToolbox */
-    IOSurfaceRef zero_copy_surface = NULL;
-#if VIRGL_RENDERER_RESOURCE_INFO_EXT_VERSION >= 1
+    /* Try zero-copy: use Metal texture's IOSurface captured at SET_SCANOUT time.
+     * This is exactly how SPICE displays the scanout — same texture, same IOSurface. */
+    HelixScanoutEncoder *enc_check = &fe->scanout_encoders[scanout_id];
+    IOSurfaceRef zero_copy_surface = enc_check->metal_iosurface;
+
     if (ready_count <= 5) {
-        helix_log("[FRAME_READY] resource %u: native_type=%d native_handle=%p version=%d",
-                  res_id, info_ext.native_type, (void *)info_ext.native_handle,
-                  info_ext.version);
+        helix_log("[FRAME_READY] scanout %u: metal_texture=%p metal_iosurface=%p (zero_copy=%s)",
+                  scanout_id, enc_check->metal_texture, zero_copy_surface,
+                  zero_copy_surface ? "YES" : "NO (CPU fallback)");
     }
-    if (info_ext.native_type == VIRGL_NATIVE_HANDLE_METAL_TEXTURE &&
-        info_ext.native_handle != 0) {
-        id<MTLTexture> mtl_texture = (__bridge id<MTLTexture>)(void *)info_ext.native_handle;
-        if (mtl_texture && mtl_texture.iosurface) {
-            zero_copy_surface = mtl_texture.iosurface;
-            if (ready_count <= 5 || (ready_count % 300) == 0) {
-                helix_log("[FRAME_READY] Zero-copy: Metal texture %p → IOSurface %p (%ux%u)",
-                          (__bridge void *)mtl_texture, zero_copy_surface, width, height);
-            }
-        } else if (ready_count <= 5) {
-            helix_log("[FRAME_READY] Metal texture %p has no IOSurface backing",
-                      mtl_texture ? (__bridge void *)mtl_texture : NULL);
-        }
-    } else if (ready_count <= 5) {
-        helix_log("[FRAME_READY] No Metal texture (native_type=%d), using CPU fallback",
-                  info_ext.native_type);
-    }
-#endif
 
     /* Create or update encoder */
     HelixScanoutEncoder *enc = &fe->scanout_encoders[scanout_id];
@@ -2389,6 +2414,8 @@ int helix_frame_export_init(void *virtio_gpu, int vsock_port)
         fe->scanout_encoders[i].session = NULL;
         fe->scanout_encoders[i].configured = false;
         fe->scanout_encoders[i].cached_surface = NULL;
+        fe->scanout_encoders[i].metal_texture = NULL;
+        fe->scanout_encoders[i].metal_iosurface = NULL;
     }
 
     /* Set global singleton */

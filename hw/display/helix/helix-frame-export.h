@@ -142,7 +142,9 @@ typedef struct HelixScanoutEncoder {
     int32_t bitrate;        /* Target bitrate in bps (0 = auto-scale from resolution) */
     bool configured;
     uint64_t frame_count;
-    IOSurfaceRef cached_surface;  /* Reusable IOSurface to avoid alloc/free per frame */
+    IOSurfaceRef cached_surface;    /* Reusable IOSurface for CPU fallback path */
+    void *metal_texture;            /* MTLTexture* captured at SET_SCANOUT (retained) */
+    IOSurfaceRef metal_iosurface;   /* IOSurface backing the Metal texture (not retained) */
 } HelixScanoutEncoder;
 
 /*
