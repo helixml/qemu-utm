@@ -2150,6 +2150,16 @@ static IOSurfaceRef helix_gpu_blit_frame(HelixFrameExport *fe,
     EGLSurface prev_draw = eglGetCurrentSurface(EGL_DRAW);
     EGLSurface prev_read = eglGetCurrentSurface(EGL_READ);
 
+    /* Flush virglrenderer's pending GPU commands BEFORE switching contexts.
+     * virglrenderer and helix use separate EGL contexts in a shared group.
+     * Texture data is shared, but command execution is NOT synchronized
+     * between contexts. Without this glFinish(), the blit can read tex_id
+     * while virglrenderer's ANGLE/Metal commands are still rendering to it,
+     * producing partial frames that cause ghosting in the H.264 stream. */
+    if (prev_ctx != EGL_NO_CONTEXT) {
+        glFinish();
+    }
+
     /* Make helix context current with the IOSurface pbuffer.
      * This is required for the IOSurface-backed texture to be writable. */
     EGLBoolean ok = eglMakeCurrent(qemu_egl_display,
