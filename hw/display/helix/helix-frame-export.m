@@ -1908,305 +1908,13 @@ static int create_scanout_encoder(HelixFrameExport *fe, uint32_t scanout_id,
  * The GL blit is sub-millisecond on Apple Silicon even at 5K.
  * ======================================================================== */
 
-/*
- * Initialize GPU blit subsystem: create a shared EGL context.
- * Must be called when virglrenderer's GL context is current (i.e. right
- * after virgl_renderer_init in virtio_gpu_virgl_init).
- */
-static void helix_init_gpu_blit(HelixFrameExport *fe)
-{
-    fe->gl_blit_available = false;
-    fe->helix_egl_ctx = NULL;
+/* GL blit subsystem removed — Metal IOSurface snapshot is the only capture mode.
+ * The GL blit via ANGLE used a separate Metal command queue from KosmicKrisp/
+ * virglrenderer with no cross-queue GPU synchronization, causing severe visual
+ * corruption. See git history for the removed functions. */
 
-    if (!qemu_egl_display) {
-        helix_log("[GPU_BLIT] EGL display not available, GPU blit disabled");
-        return;
-    }
 
-    /* Get the current EGL context (should be virglrenderer's after virgl_renderer_init) */
-    EGLContext current = eglGetCurrentContext();
-    if (current == EGL_NO_CONTEXT) {
-        helix_log("[GPU_BLIT] No current EGL context at init time, GPU blit disabled");
-        return;
-    }
 
-    /* Create a new EGL context that shares textures with virglrenderer.
-     * This lets us see virglrenderer's tex_id textures from our context. */
-    bool gles = true;  /* ANGLE on macOS uses GLES */
-    const EGLint ctx_att_gles[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
-    const EGLint ctx_att_core[] = {
-        EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
-        EGL_NONE
-    };
-
-    EGLContext helix_ctx = eglCreateContext(
-        qemu_egl_display, qemu_egl_config, current,
-        gles ? ctx_att_gles : ctx_att_core);
-
-    if (helix_ctx == EGL_NO_CONTEXT) {
-        /* Try core profile if GLES failed */
-        helix_ctx = eglCreateContext(
-            qemu_egl_display, qemu_egl_config, current, ctx_att_core);
-    }
-
-    if (helix_ctx == EGL_NO_CONTEXT) {
-        helix_log("[GPU_BLIT] Failed to create shared EGL context: %s",
-                  eglGetError() == EGL_BAD_MATCH ? "EGL_BAD_MATCH" :
-                  eglGetError() == EGL_BAD_CONFIG ? "EGL_BAD_CONFIG" : "unknown");
-        return;
-    }
-
-    fe->helix_egl_ctx = helix_ctx;
-    fe->gl_blit_available = true;
-
-    helix_log("[GPU_BLIT] GPU blit initialized: shared EGL context=%p (share=%p)",
-              helix_ctx, current);
-    helix_log("[GPU_BLIT] ANGLE native device=%p", qemu_egl_angle_native_device);
-}
-
-/*
- * Destroy per-scanout GPU blit resources.
- */
-static void helix_destroy_scanout_blit(HelixScanoutEncoder *enc)
-{
-    if (enc->blit_egl_surface) {
-        eglDestroySurface(qemu_egl_display, (EGLSurface)enc->blit_egl_surface);
-        enc->blit_egl_surface = NULL;
-    }
-    /* GL objects (textures, FBOs) are destroyed when the EGL surface is destroyed */
-    enc->blit_dst_tex = 0;
-    enc->blit_dst_fbo = 0;
-    enc->blit_src_fbo = 0;
-    if (enc->blit_iosurface) {
-        CFRelease(enc->blit_iosurface);
-        enc->blit_iosurface = NULL;
-    }
-    enc->blit_width = 0;
-    enc->blit_height = 0;
-}
-
-/*
- * Set up per-scanout GPU blit resources: IOSurface + EGL pbuffer + GL FBOs.
- * Returns true on success.
- */
-static bool helix_setup_scanout_blit(HelixFrameExport *fe,
-                                     HelixScanoutEncoder *enc,
-                                     uint32_t scanout_id,
-                                     uint32_t width, uint32_t height)
-{
-    /* Clean up previous resources if size changed */
-    if (enc->blit_iosurface) {
-        helix_destroy_scanout_blit(enc);
-    }
-
-    /* 1. Create IOSurface (BGRA, same format VideoToolbox expects) */
-    CFMutableDictionaryRef props = CFDictionaryCreateMutable(
-        kCFAllocatorDefault, 0,
-        &kCFTypeDictionaryKeyCallBacks,
-        &kCFTypeDictionaryValueCallBacks);
-
-    int w = (int)width, h = (int)height;
-    size_t bpe = 4;
-    uint32_t pixfmt = 'BGRA';
-    CFNumberRef wNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &w);
-    CFNumberRef hNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &h);
-    CFNumberRef bpeNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberLongType, &bpe);
-    CFNumberRef pfNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &pixfmt);
-    CFDictionarySetValue(props, kIOSurfaceWidth, wNum);
-    CFDictionarySetValue(props, kIOSurfaceHeight, hNum);
-    CFDictionarySetValue(props, kIOSurfaceBytesPerElement, bpeNum);
-    CFDictionarySetValue(props, kIOSurfacePixelFormat, pfNum);
-#if TARGET_OS_OSX
-    CFDictionarySetValue(props, kIOSurfaceIsGlobal, kCFBooleanTrue);
-#endif
-    CFRelease(wNum);
-    CFRelease(hNum);
-    CFRelease(bpeNum);
-    CFRelease(pfNum);
-
-    IOSurfaceRef surface = IOSurfaceCreate(props);
-    CFRelease(props);
-
-    if (!surface) {
-        helix_log("[GPU_BLIT] IOSurfaceCreate failed for scanout %u (%ux%u)",
-                  scanout_id, width, height);
-        return false;
-    }
-
-    /* 2. Query ANGLE's texture target for IOSurface binding */
-    EGLint target = 0;
-    GLenum tex_target = GL_TEXTURE_2D;
-    if (eglGetConfigAttrib(qemu_egl_display, qemu_egl_config,
-                           EGL_BIND_TO_TEXTURE_TARGET_ANGLE, &target) == EGL_TRUE) {
-        if (target == EGL_TEXTURE_RECTANGLE_ANGLE) {
-            tex_target = GL_TEXTURE_RECTANGLE;
-        }
-        /* else default GL_TEXTURE_2D */
-    }
-
-    /* 3. Create EGL pbuffer from IOSurface (ANGLE extension) */
-    const EGLint pbuf_attrs[] = {
-        EGL_WIDTH,                         (EGLint)width,
-        EGL_HEIGHT,                        (EGLint)height,
-        EGL_IOSURFACE_PLANE_ANGLE,         0,
-        EGL_TEXTURE_TARGET,                target ? target : EGL_TEXTURE_2D,
-        EGL_TEXTURE_INTERNAL_FORMAT_ANGLE, GL_BGRA_EXT,
-        EGL_TEXTURE_FORMAT,                EGL_TEXTURE_RGBA,
-        EGL_TEXTURE_TYPE_ANGLE,            GL_UNSIGNED_BYTE,
-        EGL_IOSURFACE_USAGE_HINT_ANGLE,    EGL_IOSURFACE_WRITE_HINT_ANGLE,
-        EGL_NONE,                          EGL_NONE,
-    };
-
-    /* Save current EGL state */
-    EGLContext prev_ctx = eglGetCurrentContext();
-    EGLSurface prev_draw = eglGetCurrentSurface(EGL_DRAW);
-    EGLSurface prev_read = eglGetCurrentSurface(EGL_READ);
-
-    /* qemu_egl_init_buffer_surface creates the pbuffer and makes context current */
-    EGLSurface pbuf = qemu_egl_init_buffer_surface(
-        (EGLContext)fe->helix_egl_ctx,
-        EGL_IOSURFACE_ANGLE,
-        (EGLClientBuffer)surface,
-        pbuf_attrs);
-
-    if (!pbuf) {
-        helix_log("[GPU_BLIT] EGL pbuffer creation failed for scanout %u (%ux%u)",
-                  scanout_id, width, height);
-        /* Restore context */
-        eglMakeCurrent(qemu_egl_display, prev_draw, prev_read, prev_ctx);
-        CFRelease(surface);
-        return false;
-    }
-
-    /* 4. Create GL texture and bind to IOSurface via pbuffer.
-     * After eglBindTexImage, writes to this texture go to the IOSurface. */
-    GLuint dst_tex;
-    glGenTextures(1, &dst_tex);
-    glBindTexture(tex_target, dst_tex);
-    glTexParameteri(tex_target, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(tex_target, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-
-    if (eglBindTexImage(qemu_egl_display, pbuf, EGL_BACK_BUFFER) != EGL_TRUE) {
-        helix_log("[GPU_BLIT] eglBindTexImage failed for scanout %u", scanout_id);
-        glDeleteTextures(1, &dst_tex);
-        eglMakeCurrent(qemu_egl_display, prev_draw, prev_read, prev_ctx);
-        qemu_egl_destroy_surface(pbuf);
-        CFRelease(surface);
-        return false;
-    }
-
-    /* 5. Create FBOs: destination (IOSurface-backed) and source (for tex_id) */
-    GLuint dst_fbo, src_fbo;
-    glGenFramebuffers(1, &dst_fbo);
-    glGenFramebuffers(1, &src_fbo);
-
-    /* Attach destination texture to destination FBO */
-    glBindFramebuffer(GL_FRAMEBUFFER, dst_fbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, tex_target, dst_tex, 0);
-
-    GLenum fbo_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-    if (fbo_status != GL_FRAMEBUFFER_COMPLETE) {
-        helix_log("[GPU_BLIT] Dest FBO incomplete (status=0x%x) for scanout %u",
-                  fbo_status, scanout_id);
-        glDeleteFramebuffers(1, &dst_fbo);
-        glDeleteFramebuffers(1, &src_fbo);
-        glDeleteTextures(1, &dst_tex);
-        eglMakeCurrent(qemu_egl_display, prev_draw, prev_read, prev_ctx);
-        qemu_egl_destroy_surface(pbuf);
-        CFRelease(surface);
-        return false;
-    }
-
-    /* Restore previous EGL state */
-    eglMakeCurrent(qemu_egl_display, prev_draw, prev_read, prev_ctx);
-
-    /* Store resources */
-    enc->blit_iosurface = surface;
-    enc->blit_dst_tex = dst_tex;
-    enc->blit_dst_fbo = dst_fbo;
-    enc->blit_src_fbo = src_fbo;
-    enc->blit_egl_surface = (void *)pbuf;
-    enc->blit_width = (int32_t)width;
-    enc->blit_height = (int32_t)height;
-
-    helix_log("[GPU_BLIT] Setup scanout %u: %ux%u IOSurface=%p tex=%u dst_fbo=%u src_fbo=%u target=0x%x",
-              scanout_id, width, height, surface, dst_tex, dst_fbo, src_fbo, tex_target);
-
-    return true;
-}
-
-/*
- * Perform GPU blit from virglrenderer's texture to IOSurface.
- * Returns the IOSurface (with incremented use count) on success, NULL on failure.
- */
-static IOSurfaceRef helix_gpu_blit_frame(HelixFrameExport *fe,
-                                         HelixScanoutEncoder *enc,
-                                         uint32_t scanout_id,
-                                         uint32_t tex_id,
-                                         uint32_t width, uint32_t height)
-{
-    /* Save current EGL state */
-    EGLContext prev_ctx = eglGetCurrentContext();
-    EGLSurface prev_draw = eglGetCurrentSurface(EGL_DRAW);
-    EGLSurface prev_read = eglGetCurrentSurface(EGL_READ);
-
-    /* Flush virglrenderer's pending GPU commands BEFORE switching contexts.
-     * virglrenderer and helix use separate EGL contexts in a shared group.
-     * Texture data is shared, but command execution is NOT synchronized
-     * between contexts. Without this glFinish(), the blit can read tex_id
-     * while virglrenderer's ANGLE/Metal commands are still rendering to it,
-     * producing partial frames that cause ghosting in the H.264 stream. */
-    if (prev_ctx != EGL_NO_CONTEXT) {
-        glFinish();
-    }
-
-    /* Make helix context current with the IOSurface pbuffer.
-     * This is required for the IOSurface-backed texture to be writable. */
-    EGLBoolean ok = eglMakeCurrent(qemu_egl_display,
-                                    (EGLSurface)enc->blit_egl_surface,
-                                    (EGLSurface)enc->blit_egl_surface,
-                                    (EGLContext)fe->helix_egl_ctx);
-    if (!ok) {
-        helix_log("[GPU_BLIT] eglMakeCurrent failed for scanout %u", scanout_id);
-        eglMakeCurrent(qemu_egl_display, prev_draw, prev_read, prev_ctx);
-        return NULL;
-    }
-
-    /* Attach virglrenderer's texture to source FBO */
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, enc->blit_src_fbo);
-    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                           GL_TEXTURE_2D, tex_id, 0);
-
-    GLenum src_status = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);
-    if (src_status != GL_FRAMEBUFFER_COMPLETE) {
-        static uint64_t src_err_count = 0;
-        if (++src_err_count <= 5) {
-            helix_log("[GPU_BLIT] Source FBO incomplete (status=0x%x) tex_id=%u scanout=%u",
-                      src_status, tex_id, scanout_id);
-        }
-        eglMakeCurrent(qemu_egl_display, prev_draw, prev_read, prev_ctx);
-        return NULL;
-    }
-
-    /* Bind destination FBO (IOSurface-backed) */
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, enc->blit_dst_fbo);
-
-    /* GPU blit: copies texture data entirely on GPU.
-     * At 5K (5120x2880) this is sub-millisecond vs 59MB CPU readback. */
-    glBlitFramebuffer(0, 0, (GLint)width, (GLint)height,
-                      0, 0, (GLint)width, (GLint)height,
-                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
-
-    /* Ensure blit completes before VideoToolbox reads the IOSurface */
-    glFinish();
-
-    /* Restore previous EGL state so virglrenderer isn't disrupted */
-    eglMakeCurrent(qemu_egl_display, prev_draw, prev_read, prev_ctx);
-
-    /* Return the IOSurface with incremented use count */
-    IOSurfaceIncrementUseCount(enc->blit_iosurface);
-    return enc->blit_iosurface;
-}
 
 /*
  * Auto-encode a scanout frame on page flip.
@@ -2297,9 +2005,9 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
     IOSurfaceRef zero_copy_surface = enc_check->metal_iosurface;
 
     if (ready_count <= 5) {
-        helix_log("[FRAME_READY] scanout %u: tex_id=%u metal_texture=%p metal_iosurface=%p gl_blit=%d",
+        helix_log("[FRAME_READY] scanout %u: tex_id=%u metal_texture=%p metal_iosurface=%p",
                   scanout_id, info_ext.base.tex_id, enc_check->metal_texture,
-                  zero_copy_surface, fe->gl_blit_available);
+                  zero_copy_surface);
     }
 
     /* Create or update encoder */
@@ -2308,10 +2016,6 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
         int32_t prev_bitrate = enc->bitrate;
         if (create_scanout_encoder(fe, scanout_id, width, height, prev_bitrate) != 0) {
             return;
-        }
-        if (enc->cached_surface) {
-            CFRelease(enc->cached_surface);
-            enc->cached_surface = NULL;
         }
         if (enc->encode_snapshot) {
             CFRelease(enc->encode_snapshot);
@@ -2322,38 +2026,26 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
     IOSurfaceRef encode_surface = NULL;
 
     /*
-     * Frame capture priority:
-     * 1. GPU blit via EGL/ANGLE (sub-ms, zero CPU copy, uses tex_id)
-     * 2. Metal IOSurface snapshot (if metal_iosurface available)
-     * 3. CPU readback via virgl_renderer_transfer_read_iov (slow, 59MB/frame at 5K)
+     * Frame capture: Metal IOSurface snapshot (only supported mode).
+     * Uses IOSurfaceLock for proper GPU sync, bypasses ANGLE/EGL entirely.
+     *
+     * Why Metal IOSurface instead of GL blit:
+     * The GL blit reads from virglrenderer's tex_id via a separate ANGLE EGL
+     * context.  ANGLE's Metal backend uses its own MTLCommandQueue, while
+     * KosmicKrisp/virglrenderer uses a different queue.  Metal does NOT
+     * automatically synchronize across command queues, so the GL blit can
+     * read partially-rendered frames → severe visual corruption.
+     * IOSurfaceLock(kIOSurfaceLockReadOnly) is Apple's proper mechanism:
+     * it waits for ALL pending GPU writes to the surface (across all command
+     * queues) before granting CPU read access.
      */
 
-    /* Path 1: GPU blit — get virglrenderer's GL texture ID and blit to IOSurface */
     uint32_t tex_id = info_ext.base.tex_id;
-    if (fe->gl_blit_available && tex_id != 0) {
-        /* Ensure per-scanout blit resources exist and match current dimensions */
-        if (!enc->blit_iosurface ||
-            enc->blit_width != (int32_t)width ||
-            enc->blit_height != (int32_t)height) {
-            helix_setup_scanout_blit(fe, enc, scanout_id, width, height);
-        }
 
-        if (enc->blit_iosurface) {
-            encode_surface = helix_gpu_blit_frame(fe, enc, scanout_id,
-                                                   tex_id, width, height);
-            if (encode_surface) {
-                static uint64_t gpu_blit_count = 0;
-                gpu_blit_count++;
-                if (gpu_blit_count <= 5 || (gpu_blit_count % 500) == 0) {
-                    helix_log("[FRAME_READY] GPU blit #%llu: scanout=%u tex_id=%u %ux%u",
-                              gpu_blit_count, scanout_id, tex_id, width, height);
-                }
-            }
-        }
-    }
-
-    /* Path 2: Metal IOSurface snapshot (existing zero-copy path, rarely reached) */
-    if (!encode_surface && zero_copy_surface) {
+    /* Path 1: Metal IOSurface snapshot — preferred for correctness.
+     * IOSurfaceLock waits for all GPU writes to complete before granting
+     * read access, providing proper cross-queue synchronization. */
+    if (zero_copy_surface) {
         /* Create or recreate snapshot surface if dimensions changed */
         if (enc->encode_snapshot) {
             uint32_t snap_w = (uint32_t)IOSurfaceGetWidth(enc->encode_snapshot);
@@ -2415,65 +2107,33 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
 
         encode_surface = enc->encode_snapshot;
         IOSurfaceIncrementUseCount(encode_surface);
+
+        static uint64_t metal_snap_count = 0;
+        metal_snap_count++;
+        if (metal_snap_count <= 5 || (metal_snap_count % 500) == 0) {
+            helix_log("[FRAME_READY] Metal IOSurface snapshot #%llu: scanout=%u %ux%u",
+                      metal_snap_count, scanout_id, width, height);
+        }
     }
 
-    /* Path 3: CPU readback (last resort — 59MB/frame at 5K) */
+    /* No fallback paths — Metal IOSurface is the only supported capture mode.
+     * If metal_iosurface is not available, log an error and skip the frame.
+     * Fallback code paths (GL blit, CPU readback) have been removed because:
+     * - GL blit via ANGLE causes severe visual corruption due to missing
+     *   cross-Metal-command-queue synchronization
+     * - CPU readback via virgl_renderer_transfer_read_iov is too slow (59MB/frame)
+     * - Having fallbacks makes it impossible to tell which path is actually running
+     */
     if (!encode_surface) {
-        static uint64_t cpu_fallback_count = 0;
-        cpu_fallback_count++;
-        if (cpu_fallback_count <= 5 || (cpu_fallback_count % 500) == 0) {
-            helix_log("[FRAME_READY] CPU fallback #%llu: scanout=%u res=%u tex_id=%u gl_blit=%d",
-                      cpu_fallback_count, scanout_id, res_id, tex_id,
-                      fe->gl_blit_available);
+        static uint64_t no_surface_count = 0;
+        no_surface_count++;
+        if (no_surface_count <= 10 || (no_surface_count % 1000) == 0) {
+            helix_log("[FRAME_READY] ERROR: no metal_iosurface for scanout %u "
+                      "(metal_texture=%p zero_copy=%p tex_id=%u) — frame dropped #%llu",
+                      scanout_id, enc->metal_texture, zero_copy_surface,
+                      tex_id, no_surface_count);
         }
-
-        if (!enc->cached_surface) {
-            size_t row_bytes = width * 4;
-            CFMutableDictionaryRef props = CFDictionaryCreateMutable(
-                kCFAllocatorDefault, 0,
-                &kCFTypeDictionaryKeyCallBacks,
-                &kCFTypeDictionaryValueCallBacks);
-            CFNumberRef widthNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &width);
-            CFNumberRef heightNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &height);
-            CFNumberRef bytesPerRow = CFNumberCreate(kCFAllocatorDefault, kCFNumberLongType, &row_bytes);
-            uint32_t pixelFormat = kCVPixelFormatType_32BGRA;
-            CFNumberRef pixelFormatNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &pixelFormat);
-            CFDictionarySetValue(props, kIOSurfaceWidth, widthNum);
-            CFDictionarySetValue(props, kIOSurfaceHeight, heightNum);
-            CFDictionarySetValue(props, kIOSurfaceBytesPerRow, bytesPerRow);
-            CFDictionarySetValue(props, kIOSurfacePixelFormat, pixelFormatNum);
-            CFRelease(widthNum);
-            CFRelease(heightNum);
-            CFRelease(bytesPerRow);
-            CFRelease(pixelFormatNum);
-            enc->cached_surface = IOSurfaceCreate(props);
-            CFRelease(props);
-            if (!enc->cached_surface) {
-                return;
-            }
-            helix_log("[FRAME_READY] CPU fallback: created cached IOSurface for scanout %u: %ux%u",
-                      scanout_id, width, height);
-        }
-
-        IOSurfaceLock(enc->cached_surface, 0, NULL);
-        void *surface_base = IOSurfaceGetBaseAddress(enc->cached_surface);
-        size_t row_bytes = width * 4;
-        size_t buffer_size = row_bytes * height;
-
-        struct iovec iov = { .iov_base = surface_base, .iov_len = buffer_size };
-        struct { uint32_t x, y, z, w, h, d; } box = { 0, 0, 0, width, height, 1 };
-
-        virgl_renderer_force_ctx_0();
-        ret = virgl_renderer_transfer_read_iov(
-            res_id, 0, 0, (uint32_t)row_bytes, 0,
-            (struct virgl_box *)&box, 0, &iov, 1);
-        IOSurfaceUnlock(enc->cached_surface, 0, NULL);
-
-        if (ret != 0) {
-            return;
-        }
-        encode_surface = enc->cached_surface;
-        IOSurfaceIncrementUseCount(encode_surface);
+        return;
     }
 
     /*
@@ -2883,25 +2543,13 @@ int helix_frame_export_init(void *virtio_gpu, int vsock_port)
     for (int i = 0; i < HELIX_MAX_SCANOUTS; i++) {
         fe->scanout_encoders[i].session = NULL;
         fe->scanout_encoders[i].configured = false;
-        fe->scanout_encoders[i].cached_surface = NULL;
         fe->scanout_encoders[i].encode_snapshot = NULL;
         fe->scanout_encoders[i].metal_texture = NULL;
         fe->scanout_encoders[i].metal_iosurface = NULL;
-        fe->scanout_encoders[i].blit_iosurface = NULL;
-        fe->scanout_encoders[i].blit_dst_tex = 0;
-        fe->scanout_encoders[i].blit_dst_fbo = 0;
-        fe->scanout_encoders[i].blit_src_fbo = 0;
-        fe->scanout_encoders[i].blit_egl_surface = NULL;
-        fe->scanout_encoders[i].blit_width = 0;
-        fe->scanout_encoders[i].blit_height = 0;
     }
 
     /* Set global singleton */
     g_helix_export = fe;
-
-    /* Initialize GPU blit subsystem (must happen while virglrenderer's
-     * GL context is current — we're called right after virgl_renderer_init) */
-    helix_init_gpu_blit(fe);
 
     /* Set up TCP socket listener */
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
