@@ -2359,17 +2359,18 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
     CMTime cmPts = CMTimeMake(pts, 1000000000);
     CMTime cmDuration = CMTimeMake(16666667, 1000000000);
 
-    /* Force keyframe on first frame only */
-    CFMutableDictionaryRef frameProps = NULL;
-    if (enc->frame_count == 1) {
-        frameProps = CFDictionaryCreateMutable(
-            kCFAllocatorDefault, 1,
-            &kCFTypeDictionaryKeyCallBacks,
-            &kCFTypeDictionaryValueCallBacks);
-        CFDictionarySetValue(frameProps,
-                             kVTEncodeFrameOptionKey_ForceKeyFrame,
-                             kCFBooleanTrue);
-    }
+    /* Force every frame as keyframe for diagnostic.
+     * If corruption goes away: the issue is P-frame prediction referencing
+     * a previously corrupt frame (one bad blit propagates via inter-frame).
+     * If corruption persists: the issue is in the blit/pixel data itself.
+     * TODO: revert to keyframe-on-first-frame once corruption is resolved. */
+    CFMutableDictionaryRef frameProps = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 1,
+        &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks);
+    CFDictionarySetValue(frameProps,
+                         kVTEncodeFrameOptionKey_ForceKeyFrame,
+                         kCFBooleanTrue);
 
     /* Encode — async. VT calls scanout_encoder_callback on completion,
      * which schedules the BH to call gl_block(false). If EncodeFrame
