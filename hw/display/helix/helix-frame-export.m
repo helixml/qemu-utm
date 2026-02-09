@@ -15,6 +15,8 @@ int helix_enable_scanout(void *virtio_gpu, uint32_t scanout_id,
                          uint32_t width, uint32_t height);
 int helix_disable_scanout(void *virtio_gpu, uint32_t scanout_id);
 void helix_gl_block(void *virtio_gpu, bool block);
+void *helix_create_gl_unblock_bh(void *virtio_gpu);
+void helix_schedule_gl_unblock(void *bh);
 
 #ifdef __APPLE__
 
@@ -1627,6 +1629,11 @@ static void scanout_encoder_callback(void *outputCallbackRefCon,
     uint32_t scanout_id = ctx->scanout_id;
     int64_t pts = (int64_t)sourceFrameRefCon;
 
+    /* Unblock virtio-gpu command queue — encode is done (success or failure).
+     * This fires on the VT callback thread; qemu_bh_schedule is thread-safe
+     * and bounces to the main thread for the actual gl_block(false) call. */
+    helix_schedule_gl_unblock(fe->gl_unblock_bh);
+
     if (status != noErr || !sampleBuffer) {
         fe->encode_errors++;
         return;
@@ -2287,16 +2294,16 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
         }
     }
 
-    /* GL blit from virgl texture → IOSurface ring slot (GPU-only, zero CPU copy).
-     * IOSurfaceLock fence inside helix_gl_blit_frame ensures the GPU blit
-     * completes before VT reads the IOSurface.
-     *
-     * Note: backpressure via helix_gl_block is not used here because we're
-     * called from inside virtio_gpu_process_cmdq, and the gl_flushed callback
-     * on unblock would try to re-enter process_cmdq. The re-entrancy guard
-     * (g->processing_cmdq) prevents actual re-entry but could cause the
-     * unblock's queued commands to be lost. The IOSurfaceLock fence alone
-     * provides sufficient GPU synchronization. */
+    /* Backpressure: block the virtio-gpu command queue before the blit.
+     * Matches SPICE's gl_block pattern exactly:
+     *   - gl_block(true) here stops process_cmdq from processing more commands
+     *   - glFlush() in helix_gl_blit_frame submits the blit (non-blocking)
+     *   - VT encode callback schedules a BH that calls gl_block(false)
+     *   - BH fires on next main loop iteration, safely outside process_cmdq
+     * This ensures the guest can't modify the virgl texture while we're
+     * reading it, and prevents frames from piling up. */
+    helix_gl_block(virtio_gpu, true);
+
     IOSurfaceRef blit_surface = helix_gl_blit_frame(fe, scanout_id,
                                                       tex_id, width, height);
 
@@ -2308,7 +2315,8 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
                       "(tex_id=%u %ux%u) — frame dropped #%llu",
                       scanout_id, tex_id, width, height, blit_fail_count);
         }
-        return;  /* gl_block already released above */
+        helix_schedule_gl_unblock(fe->gl_unblock_bh);
+        return;
     }
 
     /* Wrap IOSurface directly as CVPixelBuffer — zero-copy.
@@ -2326,6 +2334,7 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
                       "for scanout %u: %d — frame dropped #%llu",
                       scanout_id, (int)cvRet, cvpb_fail_count);
         }
+        helix_schedule_gl_unblock(fe->gl_unblock_bh);
         return;
     }
 
@@ -2354,7 +2363,9 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
                              kCFBooleanTrue);
     }
 
-    /* Encode */
+    /* Encode — async. VT calls scanout_encoder_callback on completion,
+     * which schedules the BH to call gl_block(false). If EncodeFrame
+     * itself fails, the callback won't fire so we unblock immediately. */
     OSStatus encStatus = VTCompressionSessionEncodeFrame(
         enc->session, pixelBuffer, cmPts, cmDuration,
         frameProps, (void *)pts, NULL);
@@ -2362,6 +2373,10 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
     if (enc->frame_count <= 5 || (enc->frame_count % 100) == 0) {
         helix_log("[ENCODE] scanout=%u frame=%lld status=%d %ux%u",
                   scanout_id, enc->frame_count, (int)encStatus, width, height);
+    }
+
+    if (encStatus != noErr) {
+        helix_schedule_gl_unblock(fe->gl_unblock_bh);
     }
 
     if (frameProps) CFRelease(frameProps);
@@ -2710,6 +2725,10 @@ int helix_frame_export_init(void *virtio_gpu, int vsock_port)
 
     /* Set global singleton */
     g_helix_export = fe;
+
+    /* Create BH for deferred gl_block(false) — matches SPICE's pattern.
+     * Scheduled from VT encode callback, fires on main thread. */
+    fe->gl_unblock_bh = helix_create_gl_unblock_bh(virtio_gpu);
 
     /* Set up TCP socket listener */
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);

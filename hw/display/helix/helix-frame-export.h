@@ -209,6 +209,10 @@ typedef struct HelixFrameExport {
      * virglrenderer via spice_gl_ctx share group) */
     void *helix_egl_ctx;            /* EGLContext */
 
+    /* Bottom-half for deferred gl_block(false) — matches SPICE's pattern.
+     * Created in init, scheduled from VT encode callback (thread-safe). */
+    void *gl_unblock_bh;            /* QEMUBH* */
+
 } HelixFrameExport;
 
 /*

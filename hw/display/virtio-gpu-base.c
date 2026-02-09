@@ -17,6 +17,7 @@
 #include "migration/blocker.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
+#include "qemu/main-loop.h"
 #include "hw/display/edid.h"
 #include "trace.h"
 
@@ -205,6 +206,36 @@ virtio_gpu_gl_block(void *opaque, bool block)
 void helix_gl_block(void *virtio_gpu, bool block)
 {
     virtio_gpu_gl_block(VIRTIO_GPU_BASE(virtio_gpu), block);
+}
+
+/*
+ * BH (bottom-half) callback for deferred gl_block(false).
+ * Fires on the main thread after VT encode completion schedules it.
+ * This matches SPICE's qemu_spice_gl_unblock_bh pattern exactly.
+ */
+static void helix_gl_unblock_bh(void *opaque)
+{
+    virtio_gpu_gl_block(VIRTIO_GPU_BASE(opaque), false);
+}
+
+/*
+ * Create a BH for deferred gl_block(false). Called once during init.
+ * Returns an opaque handle (QEMUBH*) to pass to helix_schedule_gl_unblock.
+ */
+void *helix_create_gl_unblock_bh(void *virtio_gpu)
+{
+    return qemu_bh_new(helix_gl_unblock_bh, virtio_gpu);
+}
+
+/*
+ * Schedule the gl_unblock BH from any thread (thread-safe).
+ * Called from the VT encode completion callback.
+ */
+void helix_schedule_gl_unblock(void *bh)
+{
+    if (bh) {
+        qemu_bh_schedule((QEMUBH *)bh);
+    }
 }
 
 static int
