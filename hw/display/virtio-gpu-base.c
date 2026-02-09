@@ -197,6 +197,16 @@ virtio_gpu_gl_block(void *opaque, bool block)
     }
 }
 
+/*
+ * Block/unblock the virtio-gpu command queue for helix frame encoding.
+ * Mirrors SPICE's gl_block mechanism to provide backpressure:
+ * block=true before GL blit, block=false in VT encode callback.
+ */
+void helix_gl_block(void *virtio_gpu, bool block)
+{
+    virtio_gpu_gl_block(VIRTIO_GPU_BASE(virtio_gpu), block);
+}
+
 static int
 virtio_gpu_get_flags(void *opaque)
 {

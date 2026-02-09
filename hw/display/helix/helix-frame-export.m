@@ -14,6 +14,7 @@
 int helix_enable_scanout(void *virtio_gpu, uint32_t scanout_id,
                          uint32_t width, uint32_t height);
 int helix_disable_scanout(void *virtio_gpu, uint32_t scanout_id);
+void helix_gl_block(void *virtio_gpu, bool block);
 
 #ifdef __APPLE__
 
@@ -2056,16 +2057,21 @@ static IOSurfaceRef helix_gl_blit_frame(HelixFrameExport *fe, uint32_t scanout_i
                       0, 0, width, height,
                       GL_COLOR_BUFFER_BIT, GL_NEAREST);
 
-    /* glFlush: submit ANGLE's Metal blit commands.
-     * Unlike the old code that needed glFinish() for CPU reads,
-     * zero-copy means VideoToolbox reads via hardware — Metal
-     * serializes reads after writes on the same device. */
+    /* Submit ANGLE's Metal blit commands */
     glFlush();
 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
 
-    return enc->blit_surfaces[slot];
+    /* IOSurfaceLock fence: wait for ALL pending GPU writes to this surface
+     * across all Metal command queues. This is Apple's cross-queue sync
+     * mechanism. Without this, VT could read a partially-blitted frame
+     * because ANGLE's Metal queue and VT's Metal queue are independent. */
+    IOSurfaceRef surface = enc->blit_surfaces[slot];
+    IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+    IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+
+    return surface;
 }
 
 /*
@@ -2274,18 +2280,31 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
         }
     }
 
+    /* Backpressure: block the virtio-gpu command queue during the blit.
+     * This prevents the guest from rendering into the virgl texture while
+     * we're reading from it, matching SPICE's gl_block mechanism.
+     * The IOSurfaceLock inside helix_gl_blit_frame ensures the GPU blit
+     * completes before we return, so we can unblock immediately after. */
+    helix_gl_block(virtio_gpu, true);
+
     /* GL blit from virgl texture → IOSurface ring slot (GPU-only, zero CPU copy) */
     IOSurfaceRef blit_surface = helix_gl_blit_frame(fe, scanout_id,
                                                       tex_id, width, height);
+
+    /* Unblock guest rendering — blit is complete (IOSurfaceLock fence inside
+     * helix_gl_blit_frame ensures GPU finished). VT async encode reads from
+     * a different ring slot, so no conflict with future blits. */
+    helix_gl_block(virtio_gpu, false);
+
     if (!blit_surface) {
         static uint64_t blit_fail_count = 0;
         blit_fail_count++;
         if (blit_fail_count <= 10 || (blit_fail_count % 1000) == 0) {
-            helix_log("[FRAME_READY] ERROR: GL blit failed for scanout %u "
+            helix_log("[FRAME_READY] GL blit failed for scanout %u "
                       "(tex_id=%u %ux%u) — frame dropped #%llu",
                       scanout_id, tex_id, width, height, blit_fail_count);
         }
-        return;
+        return;  /* gl_block already released above */
     }
 
     /* Wrap IOSurface directly as CVPixelBuffer — zero-copy.
