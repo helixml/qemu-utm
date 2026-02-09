@@ -120,6 +120,7 @@ typedef struct HelixErrorResponse {
 
 #define HELIX_MAX_CLIENTS  16
 #define HELIX_MAX_SCANOUTS 16
+#define HELIX_BLIT_RING_SIZE 3  /* Triple-buffer for async VT encode */
 
 /*
  * Per-client connection state
@@ -142,11 +143,24 @@ typedef struct HelixScanoutEncoder {
     int32_t bitrate;        /* Target bitrate in bps (0 = auto-scale from resolution) */
     bool configured;
     uint64_t frame_count;
-    void *metal_texture;            /* MTLTexture* captured at SET_SCANOUT (retained) */
-    IOSurfaceRef metal_iosurface;   /* IOSurface backing the Metal texture (not retained) */
-    IOSurfaceRef encode_snapshot;   /* Snapshot surface for zero-copy path: copied from
-                                     * metal_iosurface on each flush to avoid race between
-                                     * virglrenderer writing and VideoToolbox reading */
+
+    /* Zero-copy GL blit ring buffer for frame capture.
+     * Triple-buffered: GL blit writes to slot N while VideoToolbox
+     * hardware-encodes slots N-1 and N-2 asynchronously.
+     *
+     * Flow (zero CPU copies):
+     *   virgl tex_id → [GL blit] → IOSurface[N] → [CVPixelBufferCreateWithIOSurface]
+     *   → CVPixelBuffer → [VTCompressionSessionEncodeFrame] → H.264
+     *
+     * Each IOSurface is pre-bound to a GL FBO via ANGLE's EGL_IOSURFACE_ANGLE. */
+    IOSurfaceRef blit_surfaces[HELIX_BLIT_RING_SIZE];
+    void *blit_egl_surfaces[HELIX_BLIT_RING_SIZE];   /* EGLSurface[] */
+    uint32_t blit_textures[HELIX_BLIT_RING_SIZE];     /* GL texture per slot */
+    uint32_t blit_fbos[HELIX_BLIT_RING_SIZE];         /* GL FBO per slot (write) */
+    uint32_t blit_src_fbo;       /* Shared FBO for reading virgl texture */
+    uint32_t blit_ring_idx;      /* Next ring slot to write */
+    int32_t blit_width;
+    int32_t blit_height;
 
 } HelixScanoutEncoder;
 
@@ -190,6 +204,10 @@ typedef struct HelixFrameExport {
 
     /* TCP listener fd */
     int listen_fd;
+
+    /* EGL context for GL blit operations (shares texture namespace with
+     * virglrenderer via spice_gl_ctx share group) */
+    void *helix_egl_ctx;            /* EGLContext */
 
 } HelixFrameExport;
 

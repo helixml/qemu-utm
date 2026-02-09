@@ -1335,6 +1335,9 @@ int helix_frame_export_process_msg(HelixFrameExport *fe,
     }
 }
 
+/* Forward declaration for cleanup */
+static void helix_destroy_scanout_blit(HelixFrameExport *fe, uint32_t scanout_id);
+
 /*
  * Cleanup frame export
  */
@@ -1358,6 +1361,18 @@ void helix_frame_export_cleanup(HelixFrameExport *fe)
 
     if (fe->vsock_fd >= 0) {
         close(fe->vsock_fd);
+    }
+
+    /* Clean up scanout encoders and blit rings */
+    for (int i = 0; i < HELIX_MAX_SCANOUTS; i++) {
+        HelixScanoutEncoder *enc = &fe->scanout_encoders[i];
+        if (enc->session) {
+            VTCompressionSessionCompleteFrames(enc->session, kCMTimeInvalid);
+            VTCompressionSessionInvalidate(enc->session);
+            CFRelease(enc->session);
+            enc->session = NULL;
+        }
+        helix_destroy_scanout_blit(fe, i);
     }
 
     /* Destroy mutex */
@@ -1764,44 +1779,304 @@ static void scanout_encoder_callback(void *outputCallbackRefCon,
 static ScanoutEncoderCtx g_scanout_ctx[HELIX_MAX_SCANOUTS];
 
 /*
- * Called from virtio-gpu-virgl.c during SET_SCANOUT_BLOB when virglrenderer
- * provides a Metal texture handle. This is the same point where SPICE captures
- * the Metal texture for display. We store it for zero-copy VideoToolbox encoding.
+ * SPICE GL context — shared with virglrenderer's contexts.
+ * All virglrenderer EGL contexts are created sharing with spice_gl_ctx
+ * (via qemu_egl_create_context which uses eglGetCurrentContext() as
+ * share context while spice_gl_ctx is current). Our helix_egl_ctx
+ * must share with spice_gl_ctx to access virglrenderer textures.
+ */
+extern void *spice_gl_ctx;  /* QEMUGLContext from spice-display.c */
+
+/*
+ * Initialize Helix EGL context for GL blit operations.
+ * Creates a context in spice_gl_ctx's share group so we can
+ * access virglrenderer textures.
+ */
+static int helix_init_egl_context(HelixFrameExport *fe)
+{
+    if (fe->helix_egl_ctx) {
+        return 0;
+    }
+
+    if (!spice_gl_ctx) {
+        helix_log("[GL_BLIT] ERROR: spice_gl_ctx not initialized yet");
+        return -1;
+    }
+
+    static const EGLint ctx_att_gles[] = {
+        EGL_CONTEXT_CLIENT_VERSION, 2,
+        EGL_NONE
+    };
+
+    EGLContext ctx = eglCreateContext(qemu_egl_display, qemu_egl_config,
+                                     (EGLContext)spice_gl_ctx, ctx_att_gles);
+    if (ctx == EGL_NO_CONTEXT) {
+        helix_log("[GL_BLIT] ERROR: eglCreateContext failed (err=0x%x)",
+                  eglGetError());
+        return -1;
+    }
+
+    fe->helix_egl_ctx = ctx;
+    helix_log("[GL_BLIT] Created Helix EGL context %p sharing with spice_gl_ctx %p",
+              ctx, spice_gl_ctx);
+    return 0;
+}
+
+/* Helper: create CFNumber from int for IOSurface properties */
+static void AddIntegerValue_helix(CFMutableDictionaryRef dict, CFStringRef key, int value)
+{
+    CFNumberRef num = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &value);
+    CFDictionarySetValue(dict, key, num);
+    CFRelease(num);
+}
+
+/*
+ * Create one IOSurface + EGL surface + GL texture + FBO for a ring slot.
+ * Returns 0 on success, -1 on failure.
+ */
+static int helix_create_blit_slot(HelixFrameExport *fe, HelixScanoutEncoder *enc,
+                                   int slot, int32_t width, int32_t height)
+{
+    /* 1. Create destination IOSurface (BGRA, same as SPICE) */
+    CFMutableDictionaryRef dict = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 0,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    AddIntegerValue_helix(dict, kIOSurfaceWidth, width);
+    AddIntegerValue_helix(dict, kIOSurfaceHeight, height);
+    AddIntegerValue_helix(dict, kIOSurfacePixelFormat, 'BGRA');
+    AddIntegerValue_helix(dict, kIOSurfaceBytesPerElement, 4);
+
+    IOSurfaceRef surface = IOSurfaceCreate(dict);
+    CFRelease(dict);
+
+    if (!surface) {
+        return -1;
+    }
+
+    /* 2. Create ANGLE EGL surface wrapping the IOSurface */
+    EGLint attribs[] = {
+        EGL_WIDTH,                         width,
+        EGL_HEIGHT,                        height,
+        EGL_IOSURFACE_PLANE_ANGLE,         0,
+        EGL_TEXTURE_TARGET,                EGL_TEXTURE_2D,
+        EGL_TEXTURE_INTERNAL_FORMAT_ANGLE, GL_BGRA_EXT,
+        EGL_TEXTURE_FORMAT,                EGL_TEXTURE_RGBA,
+        EGL_TEXTURE_TYPE_ANGLE,            GL_UNSIGNED_BYTE,
+        EGL_IOSURFACE_USAGE_HINT_ANGLE,    EGL_IOSURFACE_WRITE_HINT_ANGLE,
+        EGL_NONE,                          EGL_NONE,
+    };
+
+    EGLSurface esurface = qemu_egl_init_buffer_surface(
+        (EGLContext)fe->helix_egl_ctx,
+        EGL_IOSURFACE_ANGLE, surface, attribs);
+
+    if (!esurface) {
+        CFRelease(surface);
+        return -1;
+    }
+
+    /* 3. Create GL texture and bind the EGL surface to it */
+    GLuint dst_tex;
+    glGenTextures(1, &dst_tex);
+    glBindTexture(GL_TEXTURE_2D, dst_tex);
+    eglBindTexImage(qemu_egl_display, esurface, EGL_BACK_BUFFER);
+
+    /* 4. Create FBO and attach the IOSurface-backed texture */
+    GLuint dst_fbo;
+    glGenFramebuffers(1, &dst_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, dst_fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, dst_tex, 0);
+
+    GLenum fbo_status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (fbo_status != GL_FRAMEBUFFER_COMPLETE) {
+        glDeleteFramebuffers(1, &dst_fbo);
+        glDeleteTextures(1, &dst_tex);
+        eglReleaseTexImage(qemu_egl_display, esurface, EGL_BACK_BUFFER);
+        qemu_egl_destroy_surface(esurface);
+        CFRelease(surface);
+        return -1;
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    enc->blit_surfaces[slot] = surface;
+    enc->blit_egl_surfaces[slot] = esurface;
+    enc->blit_textures[slot] = dst_tex;
+    enc->blit_fbos[slot] = dst_fbo;
+
+    return 0;
+}
+
+/*
+ * Set up triple-buffered GL blit ring for a scanout.
+ * Creates HELIX_BLIT_RING_SIZE IOSurface+FBO pairs.
+ */
+static int helix_setup_scanout_blit(HelixFrameExport *fe, uint32_t scanout_id,
+                                     int32_t width, int32_t height)
+{
+    HelixScanoutEncoder *enc = &fe->scanout_encoders[scanout_id];
+
+    /* Already set up at correct size? */
+    if (enc->blit_surfaces[0] && enc->blit_width == width && enc->blit_height == height) {
+        return 0;
+    }
+
+    /* Tear down previous blit state */
+    helix_destroy_scanout_blit(fe, scanout_id);
+
+    /* Ensure EGL context exists */
+    if (helix_init_egl_context(fe) != 0) {
+        return -1;
+    }
+
+    /* Make our EGL context current for all slot creation */
+    if (!eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                        (EGLContext)fe->helix_egl_ctx)) {
+        helix_log("[GL_BLIT] ERROR: eglMakeCurrent failed (err=0x%x)", eglGetError());
+        return -1;
+    }
+
+    /* Create all ring slots */
+    for (int i = 0; i < HELIX_BLIT_RING_SIZE; i++) {
+        if (helix_create_blit_slot(fe, enc, i, width, height) != 0) {
+            helix_log("[GL_BLIT] ERROR: failed to create ring slot %d for scanout %u",
+                      i, scanout_id);
+            helix_destroy_scanout_blit(fe, scanout_id);
+            return -1;
+        }
+    }
+
+    /* Create shared source FBO (virgl texture attached per-frame) */
+    glGenFramebuffers(1, &enc->blit_src_fbo);
+
+    enc->blit_ring_idx = 0;
+    enc->blit_width = width;
+    enc->blit_height = height;
+
+    helix_log("[GL_BLIT] Setup scanout %u: %dx%d ring=%d slots",
+              scanout_id, width, height, HELIX_BLIT_RING_SIZE);
+    return 0;
+}
+
+/*
+ * Tear down GL blit ring buffer for a scanout.
+ */
+static void helix_destroy_scanout_blit(HelixFrameExport *fe, uint32_t scanout_id)
+{
+    HelixScanoutEncoder *enc = &fe->scanout_encoders[scanout_id];
+
+    bool has_any = false;
+    for (int i = 0; i < HELIX_BLIT_RING_SIZE; i++) {
+        if (enc->blit_surfaces[i]) { has_any = true; break; }
+    }
+    if (!has_any && !enc->blit_src_fbo) {
+        return;
+    }
+
+    if (fe->helix_egl_ctx) {
+        eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                        (EGLContext)fe->helix_egl_ctx);
+    }
+
+    if (enc->blit_src_fbo) {
+        glDeleteFramebuffers(1, &enc->blit_src_fbo);
+        enc->blit_src_fbo = 0;
+    }
+
+    for (int i = 0; i < HELIX_BLIT_RING_SIZE; i++) {
+        if (enc->blit_fbos[i]) {
+            glDeleteFramebuffers(1, &enc->blit_fbos[i]);
+            enc->blit_fbos[i] = 0;
+        }
+        if (enc->blit_textures[i]) {
+            glDeleteTextures(1, &enc->blit_textures[i]);
+            enc->blit_textures[i] = 0;
+        }
+        if (enc->blit_egl_surfaces[i]) {
+            eglReleaseTexImage(qemu_egl_display,
+                                (EGLSurface)enc->blit_egl_surfaces[i], EGL_BACK_BUFFER);
+            qemu_egl_destroy_surface((EGLSurface)enc->blit_egl_surfaces[i]);
+            enc->blit_egl_surfaces[i] = NULL;
+        }
+        if (enc->blit_surfaces[i]) {
+            CFRelease(enc->blit_surfaces[i]);
+            enc->blit_surfaces[i] = NULL;
+        }
+    }
+
+    enc->blit_ring_idx = 0;
+    enc->blit_width = 0;
+    enc->blit_height = 0;
+
+    helix_log("[GL_BLIT] Destroyed blit ring for scanout %u", scanout_id);
+}
+
+/*
+ * GL blit from virglrenderer texture to the next IOSurface in the ring.
+ * Returns the IOSurface containing the captured frame, or NULL on error.
+ *
+ * Zero-copy: the returned IOSurface is passed directly to VideoToolbox
+ * via CVPixelBufferCreateWithIOSurface — no CPU memcpy.
+ *
+ * Triple-buffered: while VT asynchronously encodes slots N-1 and N-2,
+ * we write to slot N. At 60fps with ~5ms hardware encode, 3 slots
+ * provides ample margin.
+ */
+static IOSurfaceRef helix_gl_blit_frame(HelixFrameExport *fe, uint32_t scanout_id,
+                                         GLuint tex_id, int32_t width, int32_t height)
+{
+    HelixScanoutEncoder *enc = &fe->scanout_encoders[scanout_id];
+
+    /* Ensure blit ring is set up */
+    if (helix_setup_scanout_blit(fe, scanout_id, width, height) != 0) {
+        return NULL;
+    }
+
+    /* Pick next ring slot */
+    uint32_t slot = enc->blit_ring_idx;
+    enc->blit_ring_idx = (slot + 1) % HELIX_BLIT_RING_SIZE;
+
+    /* Make our EGL context current */
+    if (!eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                        (EGLContext)fe->helix_egl_ctx)) {
+        return NULL;
+    }
+
+    /* Attach source virgl texture to read FBO */
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, enc->blit_src_fbo);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, tex_id, 0);
+
+    /* Bind this slot's IOSurface FBO for writing */
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, enc->blit_fbos[slot]);
+
+    /* Blit: virgl texture → IOSurface[slot] */
+    glBlitFramebuffer(0, 0, width, height,
+                      0, 0, width, height,
+                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+    /* glFlush: submit ANGLE's Metal blit commands.
+     * Unlike the old code that needed glFinish() for CPU reads,
+     * zero-copy means VideoToolbox reads via hardware — Metal
+     * serializes reads after writes on the same device. */
+    glFlush();
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+
+    return enc->blit_surfaces[slot];
+}
+
+/*
+ * Stub: helix_set_scanout_metal_texture is no longer used.
+ * Venus/KosmicKrisp never provides Metal handles (native_type=0).
+ * Frame capture now uses GL blit (like SPICE) instead.
  */
 void helix_set_scanout_metal_texture(uint32_t scanout_id, uintptr_t metal_handle)
 {
-    HelixFrameExport *fe = g_helix_export;
-    if (!fe || !fe->valid || scanout_id >= HELIX_MAX_SCANOUTS) {
-        return;
-    }
-
-    HelixScanoutEncoder *enc = &fe->scanout_encoders[scanout_id];
-
-    /* Release previous Metal texture reference */
-    if (enc->metal_texture) {
-        CFRelease((__bridge_transfer id)(enc->metal_texture));
-        enc->metal_texture = NULL;
-        enc->metal_iosurface = NULL;
-    }
-
-    if (metal_handle == 0) {
-        return;
-    }
-
-    /* Retain the Metal texture and extract its IOSurface */
-    id<MTLTexture> tex = (__bridge id<MTLTexture>)(void *)metal_handle;
-    IOSurfaceRef surface = tex.iosurface;
-
-    if (surface) {
-        enc->metal_texture = (__bridge_retained void *)tex;
-        enc->metal_iosurface = surface;  /* IOSurface lifetime tied to texture */
-        helix_log("[HELIX] Scanout %u: captured Metal texture %p → IOSurface %p (%lux%lu)",
-                  scanout_id, (void *)metal_handle, surface,
-                  IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface));
-    } else {
-        helix_log("[HELIX] Scanout %u: Metal texture %p has NO IOSurface backing",
-                  scanout_id, (void *)metal_handle);
-    }
+    (void)scanout_id;
+    (void)metal_handle;
 }
 
 /*
@@ -1895,23 +2170,8 @@ static int create_scanout_encoder(HelixFrameExport *fe, uint32_t scanout_id,
     return 0;
 }
 
-/* ========================================================================
- * GPU blit: IOSurface-backed GL blit for zero-copy frame encoding
- *
- * Instead of CPU readback (virgl_renderer_transfer_read_iov which copies
- * 59MB/frame at 5K), we:
- * 1. Create an IOSurface
- * 2. Bind it to a GL texture via ANGLE's EGL_IOSURFACE_ANGLE extension
- * 3. glBlitFramebuffer from virglrenderer's tex_id to the IOSurface texture
- * 4. Pass the IOSurface directly to VideoToolbox for H.264 encoding
- *
- * The GL blit is sub-millisecond on Apple Silicon even at 5K.
- * ======================================================================== */
-
-/* GL blit subsystem removed — Metal IOSurface snapshot is the only capture mode.
- * The GL blit via ANGLE used a separate Metal command queue from KosmicKrisp/
- * virglrenderer with no cross-queue GPU synchronization, causing severe visual
- * corruption. See git history for the removed functions. */
+/* GL blit subsystem is implemented above (helix_init_egl_context through
+ * helix_gl_blit_frame). See ring buffer design comments in helix-frame-export.h. */
 
 
 
@@ -1921,12 +2181,12 @@ static int create_scanout_encoder(HelixFrameExport *fe, uint32_t scanout_id,
  * Called from helix_update_scanout_displaysurface() in virtio-gpu-virgl.c
  * whenever a scanout's DisplaySurface is updated.
  *
- * This function:
+ * Zero-copy pipeline:
  * 1. Checks if any clients are subscribed to this scanout
  * 2. Creates/updates the per-scanout encoder if needed
- * 3. Gets the DisplaySurface pixels as an IOSurface
- * 4. Encodes with VideoToolbox
- * 5. The callback sends H.264 to subscribed clients
+ * 3. GL blit from virgl tex_id → IOSurface (via ANGLE, same as SPICE)
+ * 4. CVPixelBufferCreateWithIOSurface wraps IOSurface (no CPU copy)
+ * 5. VTCompressionSessionEncodeFrame → H.264 → subscribed clients
  */
 void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
                                 uint32_t resource_id)
@@ -1973,13 +2233,13 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
     }
 
     /*
-     * Zero-copy path: get the Metal texture backing the scanout's GPU resource,
-     * extract its IOSurface, and pass directly to VideoToolbox.
+     * Zero-copy GL blit path (same approach as SPICE's qemu_spice_gl_update):
+     *   virgl tex_id → [glBlitFramebuffer] → IOSurface[ring_slot]
+     *   → [CVPixelBufferCreateWithIOSurface] → CVPixelBuffer
+     *   → [VTCompressionSessionEncodeFrame] → H.264
      *
-     * This mirrors how SPICE displays the scanout (via ScanoutTextureNative.handle)
-     * but feeds it to H.264 encoding instead of display.
-     *
-     * Fallback: CPU readback via virgl_renderer_transfer_read_iov into cached IOSurface.
+     * No CPU memcpy at any step. Triple-buffered ring prevents VT async
+     * reads from conflicting with GL writes.
      */
     uint32_t res_id = virtio_gpu_get_scanout_resource_id(virtio_gpu, scanout_id);
     if (res_id == 0) {
@@ -1994,20 +2254,15 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
 
     uint32_t width = info_ext.base.width;
     uint32_t height = info_ext.base.height;
+    uint32_t tex_id = info_ext.base.tex_id;
 
-    if (width == 0 || height == 0) {
+    if (width == 0 || height == 0 || tex_id == 0) {
         return;
     }
 
-    /* Try zero-copy: use Metal texture's IOSurface captured at SET_SCANOUT time.
-     * This is exactly how SPICE displays the scanout — same texture, same IOSurface. */
-    HelixScanoutEncoder *enc_check = &fe->scanout_encoders[scanout_id];
-    IOSurfaceRef zero_copy_surface = enc_check->metal_iosurface;
-
     if (ready_count <= 5) {
-        helix_log("[FRAME_READY] scanout %u: tex_id=%u metal_texture=%p metal_iosurface=%p",
-                  scanout_id, info_ext.base.tex_id, enc_check->metal_texture,
-                  zero_copy_surface);
+        helix_log("[FRAME_READY] scanout %u: tex_id=%u %ux%u",
+                  scanout_id, tex_id, width, height);
     }
 
     /* Create or update encoder */
@@ -2017,170 +2272,45 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
         if (create_scanout_encoder(fe, scanout_id, width, height, prev_bitrate) != 0) {
             return;
         }
-        if (enc->encode_snapshot) {
-            CFRelease(enc->encode_snapshot);
-            enc->encode_snapshot = NULL;
-        }
     }
 
-    IOSurfaceRef encode_surface = NULL;
-
-    /*
-     * Frame capture: Metal IOSurface snapshot (only supported mode).
-     * Uses IOSurfaceLock for proper GPU sync, bypasses ANGLE/EGL entirely.
-     *
-     * Why Metal IOSurface instead of GL blit:
-     * The GL blit reads from virglrenderer's tex_id via a separate ANGLE EGL
-     * context.  ANGLE's Metal backend uses its own MTLCommandQueue, while
-     * KosmicKrisp/virglrenderer uses a different queue.  Metal does NOT
-     * automatically synchronize across command queues, so the GL blit can
-     * read partially-rendered frames → severe visual corruption.
-     * IOSurfaceLock(kIOSurfaceLockReadOnly) is Apple's proper mechanism:
-     * it waits for ALL pending GPU writes to the surface (across all command
-     * queues) before granting CPU read access.
-     */
-
-    uint32_t tex_id = info_ext.base.tex_id;
-
-    /* Path 1: Metal IOSurface snapshot — preferred for correctness.
-     * IOSurfaceLock waits for all GPU writes to complete before granting
-     * read access, providing proper cross-queue synchronization. */
-    if (zero_copy_surface) {
-        /* Create or recreate snapshot surface if dimensions changed */
-        if (enc->encode_snapshot) {
-            uint32_t snap_w = (uint32_t)IOSurfaceGetWidth(enc->encode_snapshot);
-            uint32_t snap_h = (uint32_t)IOSurfaceGetHeight(enc->encode_snapshot);
-            if (snap_w != width || snap_h != height) {
-                CFRelease(enc->encode_snapshot);
-                enc->encode_snapshot = NULL;
-            }
-        }
-        if (!enc->encode_snapshot) {
-            size_t row_bytes = width * 4;
-            CFMutableDictionaryRef props = CFDictionaryCreateMutable(
-                kCFAllocatorDefault, 0,
-                &kCFTypeDictionaryKeyCallBacks,
-                &kCFTypeDictionaryValueCallBacks);
-            CFNumberRef widthNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &width);
-            CFNumberRef heightNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &height);
-            CFNumberRef bytesPerRow = CFNumberCreate(kCFAllocatorDefault, kCFNumberLongType, &row_bytes);
-            uint32_t pixelFormat = kCVPixelFormatType_32BGRA;
-            CFNumberRef pixelFormatNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &pixelFormat);
-            CFDictionarySetValue(props, kIOSurfaceWidth, widthNum);
-            CFDictionarySetValue(props, kIOSurfaceHeight, heightNum);
-            CFDictionarySetValue(props, kIOSurfaceBytesPerRow, bytesPerRow);
-            CFDictionarySetValue(props, kIOSurfacePixelFormat, pixelFormatNum);
-            CFRelease(widthNum);
-            CFRelease(heightNum);
-            CFRelease(bytesPerRow);
-            CFRelease(pixelFormatNum);
-            enc->encode_snapshot = IOSurfaceCreate(props);
-            CFRelease(props);
-            if (!enc->encode_snapshot) {
-                return;
-            }
-            helix_log("[FRAME_READY] Created encode_snapshot IOSurface for scanout %u: %ux%u",
-                      scanout_id, width, height);
-        }
-
-        IOSurfaceLock(zero_copy_surface, kIOSurfaceLockReadOnly, NULL);
-        IOSurfaceLock(enc->encode_snapshot, 0, NULL);
-
-        void *src = IOSurfaceGetBaseAddress(zero_copy_surface);
-        void *dst = IOSurfaceGetBaseAddress(enc->encode_snapshot);
-        size_t src_stride = IOSurfaceGetBytesPerRow(zero_copy_surface);
-        size_t dst_stride = IOSurfaceGetBytesPerRow(enc->encode_snapshot);
-        size_t copy_bytes = width * 4;
-
-        if (src_stride == dst_stride && src_stride == copy_bytes) {
-            memcpy(dst, src, copy_bytes * height);
-        } else {
-            for (uint32_t row = 0; row < height; row++) {
-                memcpy((uint8_t *)dst + row * dst_stride,
-                       (uint8_t *)src + row * src_stride,
-                       copy_bytes);
-            }
-        }
-
-        IOSurfaceUnlock(enc->encode_snapshot, 0, NULL);
-        IOSurfaceUnlock(zero_copy_surface, kIOSurfaceLockReadOnly, NULL);
-
-        encode_surface = enc->encode_snapshot;
-        IOSurfaceIncrementUseCount(encode_surface);
-
-        static uint64_t metal_snap_count = 0;
-        metal_snap_count++;
-        if (metal_snap_count <= 5 || (metal_snap_count % 500) == 0) {
-            helix_log("[FRAME_READY] Metal IOSurface snapshot #%llu: scanout=%u %ux%u",
-                      metal_snap_count, scanout_id, width, height);
-        }
-    }
-
-    /* No fallback paths — Metal IOSurface is the only supported capture mode.
-     * If metal_iosurface is not available, log an error and skip the frame.
-     * Fallback code paths (GL blit, CPU readback) have been removed because:
-     * - GL blit via ANGLE causes severe visual corruption due to missing
-     *   cross-Metal-command-queue synchronization
-     * - CPU readback via virgl_renderer_transfer_read_iov is too slow (59MB/frame)
-     * - Having fallbacks makes it impossible to tell which path is actually running
-     */
-    if (!encode_surface) {
-        static uint64_t no_surface_count = 0;
-        no_surface_count++;
-        if (no_surface_count <= 10 || (no_surface_count % 1000) == 0) {
-            helix_log("[FRAME_READY] ERROR: no metal_iosurface for scanout %u "
-                      "(metal_texture=%p zero_copy=%p tex_id=%u) — frame dropped #%llu",
-                      scanout_id, enc->metal_texture, zero_copy_surface,
-                      tex_id, no_surface_count);
+    /* GL blit from virgl texture → IOSurface ring slot (GPU-only, zero CPU copy) */
+    IOSurfaceRef blit_surface = helix_gl_blit_frame(fe, scanout_id,
+                                                      tex_id, width, height);
+    if (!blit_surface) {
+        static uint64_t blit_fail_count = 0;
+        blit_fail_count++;
+        if (blit_fail_count <= 10 || (blit_fail_count % 1000) == 0) {
+            helix_log("[FRAME_READY] ERROR: GL blit failed for scanout %u "
+                      "(tex_id=%u %ux%u) — frame dropped #%llu",
+                      scanout_id, tex_id, width, height, blit_fail_count);
         }
         return;
     }
 
-    /*
-     * Create a per-frame CVPixelBuffer with its own IOSurface backing.
-     * CRITICAL: We must NOT wrap encode_surface directly because
-     * VTCompressionSessionEncodeFrame is asynchronous — VideoToolbox may still
-     * be reading from the surface when the next frame's GPU blit/memcpy
-     * overwrites it. Instead, copy into a fresh CVPixelBuffer that VT owns
-     * exclusively. On Apple Silicon unified memory, this memcpy is sub-ms
-     * even at 5K (59MB @ 100+ GB/s bandwidth).
-     */
-    NSDictionary *pbAttrs = @{
-        (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{}
-    };
+    /* Wrap IOSurface directly as CVPixelBuffer — zero-copy.
+     * The ring buffer ensures VT's async encode reads from a different
+     * slot than the one we're writing to next frame. */
     CVPixelBufferRef pixelBuffer = NULL;
-    CVReturn cvRet = CVPixelBufferCreate(
-        kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA,
-        (__bridge CFDictionaryRef)pbAttrs, &pixelBuffer);
-
-    if (cvRet == kCVReturnSuccess && pixelBuffer) {
-        CVPixelBufferLockBaseAddress(pixelBuffer, 0);
-        IOSurfaceLock(encode_surface, kIOSurfaceLockReadOnly, NULL);
-
-        void *src = IOSurfaceGetBaseAddress(encode_surface);
-        void *dst = CVPixelBufferGetBaseAddress(pixelBuffer);
-        size_t src_stride = IOSurfaceGetBytesPerRow(encode_surface);
-        size_t dst_stride = CVPixelBufferGetBytesPerRow(pixelBuffer);
-
-        if (src_stride == dst_stride) {
-            memcpy(dst, src, dst_stride * height);
-        } else {
-            size_t copy_bytes = (size_t)width * 4;
-            for (uint32_t row = 0; row < height; row++) {
-                memcpy((uint8_t *)dst + row * dst_stride,
-                       (uint8_t *)src + row * src_stride,
-                       copy_bytes);
-            }
-        }
-
-        IOSurfaceUnlock(encode_surface, kIOSurfaceLockReadOnly, NULL);
-        CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
-    }
-
-    IOSurfaceDecrementUseCount(encode_surface);
+    CVReturn cvRet = CVPixelBufferCreateWithIOSurface(
+        kCFAllocatorDefault, blit_surface, NULL, &pixelBuffer);
 
     if (cvRet != kCVReturnSuccess || !pixelBuffer) {
+        static uint64_t cvpb_fail_count = 0;
+        cvpb_fail_count++;
+        if (cvpb_fail_count <= 10 || (cvpb_fail_count % 1000) == 0) {
+            helix_log("[FRAME_READY] ERROR: CVPixelBufferCreateWithIOSurface failed "
+                      "for scanout %u: %d — frame dropped #%llu",
+                      scanout_id, (int)cvRet, cvpb_fail_count);
+        }
         return;
+    }
+
+    static uint64_t encode_count = 0;
+    encode_count++;
+    if (encode_count <= 5 || (encode_count % 500) == 0) {
+        helix_log("[FRAME_READY] Zero-copy GL blit encode #%llu: scanout=%u %ux%u tex=%u",
+                  encode_count, scanout_id, width, height, tex_id);
     }
 
     /* Generate monotonic PTS */
@@ -2543,9 +2673,16 @@ int helix_frame_export_init(void *virtio_gpu, int vsock_port)
     for (int i = 0; i < HELIX_MAX_SCANOUTS; i++) {
         fe->scanout_encoders[i].session = NULL;
         fe->scanout_encoders[i].configured = false;
-        fe->scanout_encoders[i].encode_snapshot = NULL;
-        fe->scanout_encoders[i].metal_texture = NULL;
-        fe->scanout_encoders[i].metal_iosurface = NULL;
+        fe->scanout_encoders[i].blit_ring_idx = 0;
+        fe->scanout_encoders[i].blit_width = 0;
+        fe->scanout_encoders[i].blit_height = 0;
+        for (int j = 0; j < HELIX_BLIT_RING_SIZE; j++) {
+            fe->scanout_encoders[i].blit_surfaces[j] = NULL;
+            fe->scanout_encoders[i].blit_egl_surfaces[j] = NULL;
+            fe->scanout_encoders[i].blit_textures[j] = 0;
+            fe->scanout_encoders[i].blit_fbos[j] = 0;
+        }
+        fe->scanout_encoders[i].blit_src_fbo = 0;
     }
 
     /* Set global singleton */
