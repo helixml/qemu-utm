@@ -2280,21 +2280,18 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
         }
     }
 
-    /* Backpressure: block the virtio-gpu command queue during the blit.
-     * This prevents the guest from rendering into the virgl texture while
-     * we're reading from it, matching SPICE's gl_block mechanism.
-     * The IOSurfaceLock inside helix_gl_blit_frame ensures the GPU blit
-     * completes before we return, so we can unblock immediately after. */
-    helix_gl_block(virtio_gpu, true);
-
-    /* GL blit from virgl texture → IOSurface ring slot (GPU-only, zero CPU copy) */
+    /* GL blit from virgl texture → IOSurface ring slot (GPU-only, zero CPU copy).
+     * IOSurfaceLock fence inside helix_gl_blit_frame ensures the GPU blit
+     * completes before VT reads the IOSurface.
+     *
+     * Note: backpressure via helix_gl_block is not used here because we're
+     * called from inside virtio_gpu_process_cmdq, and the gl_flushed callback
+     * on unblock would try to re-enter process_cmdq. The re-entrancy guard
+     * (g->processing_cmdq) prevents actual re-entry but could cause the
+     * unblock's queued commands to be lost. The IOSurfaceLock fence alone
+     * provides sufficient GPU synchronization. */
     IOSurfaceRef blit_surface = helix_gl_blit_frame(fe, scanout_id,
                                                       tex_id, width, height);
-
-    /* Unblock guest rendering — blit is complete (IOSurfaceLock fence inside
-     * helix_gl_blit_frame ensures GPU finished). VT async encode reads from
-     * a different ring slot, so no conflict with future blits. */
-    helix_gl_block(virtio_gpu, false);
 
     if (!blit_surface) {
         static uint64_t blit_fail_count = 0;
