@@ -2066,11 +2066,11 @@ static IOSurfaceRef helix_gl_blit_frame(HelixFrameExport *fe, uint32_t scanout_i
                       0, 0, width, height,
                       GL_COLOR_BUFFER_BIT, GL_NEAREST);
 
-    /* glFinish: wait for all GL commands to complete on our context.
-     * This ensures the blit is fully done before VT reads the IOSurface.
-     * We use glFinish instead of IOSurfaceLock because IOSurfaceLock is
-     * documented for CPU access and may not fence GPU command queues. */
-    glFinish();
+    /* glFlush: submit GL commands but don't block.
+     * glFinish() hangs the main thread (stalls process_cmdq → guest GPU deadlock).
+     * SPICE uses glFlush() for the same reason. The triple-buffered ring provides
+     * enough latency for the blit to complete before VT reads the IOSurface. */
+    glFlush();
 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
