@@ -2029,8 +2029,17 @@ static IOSurfaceRef helix_gl_blit_frame(HelixFrameExport *fe, uint32_t scanout_i
 {
     HelixScanoutEncoder *enc = &fe->scanout_encoders[scanout_id];
 
-    /* Ensure blit ring is set up */
+    /* Save current EGL context so we can restore it after the blit.
+     * We're called from inside virgl_cmd_set_scanout — virglrenderer
+     * has its own context current. If we don't restore it, subsequent
+     * virglrenderer GL calls go to the wrong context → corruption. */
+    EGLContext saved_ctx = eglGetCurrentContext();
+    EGLSurface saved_read = eglGetCurrentSurface(EGL_READ);
+    EGLSurface saved_draw = eglGetCurrentSurface(EGL_DRAW);
+
+    /* Ensure blit ring is set up (this may call eglMakeCurrent) */
     if (helix_setup_scanout_blit(fe, scanout_id, width, height) != 0) {
+        eglMakeCurrent(qemu_egl_display, saved_draw, saved_read, saved_ctx);
         return NULL;
     }
 
@@ -2057,21 +2066,19 @@ static IOSurfaceRef helix_gl_blit_frame(HelixFrameExport *fe, uint32_t scanout_i
                       0, 0, width, height,
                       GL_COLOR_BUFFER_BIT, GL_NEAREST);
 
-    /* Submit ANGLE's Metal blit commands */
-    glFlush();
+    /* glFinish: wait for all GL commands to complete on our context.
+     * This ensures the blit is fully done before VT reads the IOSurface.
+     * We use glFinish instead of IOSurfaceLock because IOSurfaceLock is
+     * documented for CPU access and may not fence GPU command queues. */
+    glFinish();
 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
 
-    /* IOSurfaceLock fence: wait for ALL pending GPU writes to this surface
-     * across all Metal command queues. This is Apple's cross-queue sync
-     * mechanism. Without this, VT could read a partially-blitted frame
-     * because ANGLE's Metal queue and VT's Metal queue are independent. */
-    IOSurfaceRef surface = enc->blit_surfaces[slot];
-    IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
-    IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+    /* Restore previous EGL context */
+    eglMakeCurrent(qemu_egl_display, saved_draw, saved_read, saved_ctx);
 
-    return surface;
+    return enc->blit_surfaces[slot];
 }
 
 /*
