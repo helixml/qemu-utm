@@ -2044,6 +2044,14 @@ static IOSurfaceRef helix_gl_blit_frame(HelixFrameExport *fe, uint32_t scanout_i
     EGLSurface saved_read = eglGetCurrentSurface(EGL_READ);
     EGLSurface saved_draw = eglGetCurrentSurface(EGL_DRAW);
 
+    /* Wait for virglrenderer's GPU rendering to complete on the source texture.
+     * virglrenderer has already submitted rendering commands (we're in
+     * SET_SCANOUT which comes after rendering), but the GPU may still be
+     * executing them. glFinish() on virglrenderer's context (currently active)
+     * waits for completion. With backpressure, there's at most one frame of
+     * rendering to wait for, so this won't accumulate. */
+    glFinish();
+
     /* Ensure blit ring is set up (this may call eglMakeCurrent) */
     if (helix_setup_scanout_blit(fe, scanout_id, width, height) != 0) {
         eglMakeCurrent(qemu_egl_display, saved_draw, saved_read, saved_ctx);
@@ -2351,17 +2359,18 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
     CMTime cmPts = CMTimeMake(pts, 1000000000);
     CMTime cmDuration = CMTimeMake(16666667, 1000000000);
 
-    /* Force keyframe on first frame */
-    CFMutableDictionaryRef frameProps = NULL;
-    if (enc->frame_count == 1) {
-        frameProps = CFDictionaryCreateMutable(
-            kCFAllocatorDefault, 1,
-            &kCFTypeDictionaryKeyCallBacks,
-            &kCFTypeDictionaryValueCallBacks);
-        CFDictionarySetValue(frameProps,
-                             kVTEncodeFrameOptionKey_ForceKeyFrame,
-                             kCFBooleanTrue);
-    }
+    /* Force every frame as keyframe for diagnostic.
+     * If corruption goes away: the issue is P-frame prediction referencing
+     * a previously corrupt frame (one bad blit propagates via inter-frame).
+     * If corruption persists: the issue is in the blit/pixel data itself.
+     * TODO: revert to keyframe-on-first-frame once corruption is resolved. */
+    CFMutableDictionaryRef frameProps = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 1,
+        &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks);
+    CFDictionarySetValue(frameProps,
+                         kVTEncodeFrameOptionKey_ForceKeyFrame,
+                         kCFBooleanTrue);
 
     /* Encode — async. VT calls scanout_encoder_callback on completion,
      * which schedules the BH to call gl_block(false). If EncodeFrame
