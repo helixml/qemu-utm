@@ -1617,8 +1617,13 @@ static void helix_send_to_subscribed_clients(HelixFrameExport *fe,
         if (c->subscribed_scanout != scanout_id) continue;
 
         pthread_mutex_lock(&c->send_lock);
-        ssize_t sent = send(c->fd, response_data, response_size, MSG_NOSIGNAL);
-        if (sent < 0) {
+        /* Non-blocking send — if TCP buffer is full, drop the frame for
+         * this client rather than blocking the VT encoder callback thread.
+         * Blocking here would stall the ring slot busy flag, causing
+         * frame drops for ALL clients, not just the slow one. */
+        ssize_t sent = send(c->fd, response_data, response_size,
+                            MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
             helix_log("[HELIX] Failed to send to client %d (scanout %u): %s",
                       i, scanout_id, strerror(errno));
         }
@@ -1648,12 +1653,14 @@ static void scanout_encoder_callback(void *outputCallbackRefCon,
 
     HelixFrameExport *fe = ctx->fe;
     uint32_t scanout_id = ctx->scanout_id;
-    int64_t pts = (int64_t)sourceFrameRefCon;
+    /* Unpack slot index from sourceFrameRefCon (low 8 bits) */
+    uintptr_t ref = (uintptr_t)sourceFrameRefCon;
+    uint32_t slot = ref & 0xFF;
 
-    /* Unblock virtio-gpu command queue — encode is done (success or failure).
-     * This fires on the VT callback thread; qemu_bh_schedule is thread-safe
-     * and bounces to the main thread for the actual gl_block(false) call. */
-    helix_schedule_gl_unblock(fe->gl_unblock_bh);
+    /* Mark ring slot as free — VT is done with this IOSurface */
+    if (slot < HELIX_BLIT_RING_SIZE && scanout_id < HELIX_MAX_SCANOUTS) {
+        atomic_store(&fe->scanout_encoders[scanout_id].blit_slot_busy[slot], false);
+    }
 
     if (status != noErr || !sampleBuffer) {
         fe->encode_errors++;
@@ -1980,6 +1987,9 @@ static int helix_setup_scanout_blit(HelixFrameExport *fe, uint32_t scanout_id,
     glGenFramebuffers(1, &enc->blit_src_fbo);
 
     enc->blit_ring_idx = 0;
+    for (int i = 0; i < HELIX_BLIT_RING_SIZE; i++) {
+        atomic_init(&enc->blit_slot_busy[i], false);
+    }
     enc->blit_width = width;
     enc->blit_height = height;
 
@@ -2035,6 +2045,9 @@ static void helix_destroy_scanout_blit(HelixFrameExport *fe, uint32_t scanout_id
     }
 
     enc->blit_ring_idx = 0;
+    for (int i = 0; i < HELIX_BLIT_RING_SIZE; i++) {
+        atomic_store(&enc->blit_slot_busy[i], false);
+    }
     enc->blit_width = 0;
     enc->blit_height = 0;
 
@@ -2337,15 +2350,18 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
         }
     }
 
-    /* Backpressure: block the virtio-gpu command queue before the blit.
-     * Matches SPICE's gl_block pattern exactly:
-     *   - gl_block(true) here stops process_cmdq from processing more commands
-     *   - glFlush() in helix_gl_blit_frame submits the blit (non-blocking)
-     *   - VT encode callback schedules a BH that calls gl_block(false)
-     *   - BH fires on next main loop iteration, safely outside process_cmdq
-     * This ensures the guest can't modify the virgl texture while we're
-     * reading it, and prevents frames from piling up. */
-    helix_gl_block(virtio_gpu, true);
+    /* Check if the next ring slot is still being encoded by VT.
+     * If so, drop this frame rather than blocking the VM. */
+    uint32_t next_slot = enc->blit_ring_idx;
+    if (atomic_load(&enc->blit_slot_busy[next_slot])) {
+        static uint64_t backpressure_drops = 0;
+        backpressure_drops++;
+        if (backpressure_drops <= 5 || (backpressure_drops % 500) == 0) {
+            helix_log("[FRAME_READY] Dropping frame — slot %u still encoding "
+                      "(dropped %llu total)", next_slot, backpressure_drops);
+        }
+        return;
+    }
 
     IOSurfaceRef blit_surface = helix_gl_blit_frame(fe, scanout_id,
                                                       tex_id, width, height);
@@ -2358,7 +2374,6 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
                       "(tex_id=%u %ux%u) — frame dropped #%llu",
                       scanout_id, tex_id, width, height, blit_fail_count);
         }
-        helix_schedule_gl_unblock(fe->gl_unblock_bh);
         return;
     }
 
@@ -2377,7 +2392,6 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
                       "for scanout %u: %d — frame dropped #%llu",
                       scanout_id, (int)cvRet, cvpb_fail_count);
         }
-        helix_schedule_gl_unblock(fe->gl_unblock_bh);
         return;
     }
 
@@ -2406,20 +2420,24 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
                              kCFBooleanTrue);
     }
 
-    /* Encode — async. VT calls scanout_encoder_callback on completion,
-     * which schedules the BH to call gl_block(false). If EncodeFrame
-     * itself fails, the callback won't fire so we unblock immediately. */
+    /* Mark this ring slot as busy before submitting to VT.
+     * The VT callback will clear it when encoding is done.
+     * Pass slot index in sourceFrameRefCon (low 8 bits). */
+    atomic_store(&enc->blit_slot_busy[next_slot], true);
+
     OSStatus encStatus = VTCompressionSessionEncodeFrame(
         enc->session, pixelBuffer, cmPts, cmDuration,
-        frameProps, (void *)pts, NULL);
+        frameProps, (void *)(uintptr_t)next_slot, NULL);
 
     if (enc->frame_count <= 5 || (enc->frame_count % 100) == 0) {
-        helix_log("[ENCODE] scanout=%u frame=%lld status=%d %ux%u",
-                  scanout_id, enc->frame_count, (int)encStatus, width, height);
+        helix_log("[ENCODE] scanout=%u frame=%lld slot=%u status=%d %ux%u",
+                  scanout_id, enc->frame_count, next_slot, (int)encStatus,
+                  width, height);
     }
 
     if (encStatus != noErr) {
-        helix_schedule_gl_unblock(fe->gl_unblock_bh);
+        /* Encode failed — callback won't fire, so clear the busy flag */
+        atomic_store(&enc->blit_slot_busy[next_slot], false);
     }
 
     if (frameProps) CFRelease(frameProps);
@@ -2762,6 +2780,7 @@ int helix_frame_export_init(void *virtio_gpu, int vsock_port)
             fe->scanout_encoders[i].blit_egl_surfaces[j] = NULL;
             fe->scanout_encoders[i].blit_textures[j] = 0;
             fe->scanout_encoders[i].blit_fbos[j] = 0;
+            atomic_init(&fe->scanout_encoders[i].blit_slot_busy[j], false);
         }
         fe->scanout_encoders[i].blit_src_fbo = 0;
     }

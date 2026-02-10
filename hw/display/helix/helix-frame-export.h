@@ -15,6 +15,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 
 #ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h>
@@ -159,6 +160,7 @@ typedef struct HelixScanoutEncoder {
     uint32_t blit_fbos[HELIX_BLIT_RING_SIZE];         /* GL FBO per slot (write) */
     uint32_t blit_src_fbo;       /* Shared FBO for reading virgl texture */
     uint32_t blit_ring_idx;      /* Next ring slot to write */
+    atomic_bool blit_slot_busy[HELIX_BLIT_RING_SIZE]; /* VT encoding in progress */
     int32_t blit_width;
     int32_t blit_height;
 
