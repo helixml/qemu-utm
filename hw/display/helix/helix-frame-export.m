@@ -266,13 +266,6 @@ static void scanout_encoder_callback(void *outputCallbackRefCon,
         helix_atomic_store(&fe->scanout_encoders[scanout_id].blit_slot_busy[slot], false);
     }
 
-    /* Unblock virtio-gpu command queue (SPICE gl_draw_done equivalent).
-     * atomic_xchg ensures only one of {callback, safety timer} schedules
-     * the BH, preventing renderer_blocked from going negative. */
-    if (helix_atomic_xchg(&fe->gl_block_pending, false)) {
-        helix_schedule_gl_unblock(fe->gl_unblock_bh);
-    }
-
     if (status != noErr || !sampleBuffer) {
         fe->encode_errors++;
         return;
@@ -685,10 +678,10 @@ static IOSurfaceRef helix_gl_blit_frame(HelixFrameExport *fe, uint32_t scanout_i
     EGLSurface saved_draw = eglGetCurrentSurface(EGL_DRAW);
 
     /* glFlush on virglrenderer's context (currently active) to submit
-     * pending rendering commands. gl_block backpressure ensures there's
-     * at most one frame of rendering queued. We use glFlush not glFinish
-     * because glFinish stalls the QEMU main loop. The gl_block mechanism
-     * provides the synchronization instead. */
+     * pending rendering commands. We use glFlush not glFinish because
+     * glFinish stalls the QEMU main loop. The per-slot busy flags
+     * provide backpressure instead of gl_block (which is global and
+     * would cause one slow scanout to block all others). */
     glFlush();
 
     /* Ensure blit ring is set up (this may call eglMakeCurrent) */
@@ -960,8 +953,8 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
     enc->blit_ring_idx = (slot + 1) % HELIX_BLIT_RING_SIZE;
 
     /* If this slot is still being encoded by VT, drop the frame.
-     * This is the secondary safety net — gl_block should prevent this
-     * from happening normally, but protects against edge cases. */
+     * Per-scanout backpressure: each scanout has its own ring, so one
+     * slow scanout only drops its own frames, not other scanouts'. */
     if (helix_atomic_load(&enc->blit_slot_busy[slot])) {
         static uint64_t backpressure_drops = 0;
         backpressure_drops++;
@@ -971,12 +964,6 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
         }
         return;
     }
-
-    /* Backpressure: block the virtio-gpu command queue (SPICE pattern).
-     * gl_block(true) stops process_cmdq from processing more commands.
-     * The VT callback (or safety timer) will schedule gl_block(false). */
-    helix_gl_block(virtio_gpu, true);
-    helix_atomic_store(&fe->gl_block_pending, true);
 
     IOSurfaceRef blit_surface = helix_gl_blit_frame(fe, scanout_id, slot,
                                                       tex_id, width, height);
@@ -988,10 +975,6 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
             helix_log("[FRAME_READY] GL blit failed for scanout %u "
                       "(tex_id=%u %ux%u) — frame dropped #%llu",
                       scanout_id, tex_id, width, height, blit_fail_count);
-        }
-        /* Blit failed — unblock immediately */
-        if (helix_atomic_xchg(&fe->gl_block_pending, false)) {
-            helix_schedule_gl_unblock(fe->gl_unblock_bh);
         }
         return;
     }
@@ -1008,9 +991,6 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
             helix_log("[FRAME_READY] ERROR: CVPixelBufferCreateWithIOSurface failed "
                       "for scanout %u: %d — frame dropped #%llu",
                       scanout_id, (int)cvRet, cvpb_fail_count);
-        }
-        if (helix_atomic_xchg(&fe->gl_block_pending, false)) {
-            helix_schedule_gl_unblock(fe->gl_unblock_bh);
         }
         return;
     }
@@ -1048,26 +1028,8 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
     }
 
     if (encStatus != noErr) {
-        /* Encode failed — callback won't fire */
+        /* Encode failed — callback won't fire, so clear busy flag */
         helix_atomic_store(&enc->blit_slot_busy[slot], false);
-        if (helix_atomic_xchg(&fe->gl_block_pending, false)) {
-            helix_schedule_gl_unblock(fe->gl_unblock_bh);
-        }
-    } else {
-        /* Safety timer: auto-unblock after 100ms if VT callback never
-         * fires (e.g., client disconnected, VT internal error).
-         * Matches SPICE's qemu_spice_gl_block_timer pattern. */
-        HelixFrameExport *timer_fe = fe;
-        dispatch_after(
-            dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
-            dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
-            ^{
-                if (helix_atomic_xchg(&timer_fe->gl_block_pending, false)) {
-                    helix_log("[HELIX] SAFETY: gl_block timeout (100ms) — "
-                              "forcing unblock (VT callback didn't fire)");
-                    helix_schedule_gl_unblock(timer_fe->gl_unblock_bh);
-                }
-            });
     }
 
     if (frameProps) CFRelease(frameProps);
@@ -1384,7 +1346,6 @@ int helix_frame_export_init(void *virtio_gpu, int vsock_port)
     fe->valid = true;
     fe->virtio_gpu = virtio_gpu;
     fe->listen_fd = -1;
-    fe->gl_block_pending = false;
 
     /* Initialize client slots */
     for (int i = 0; i < HELIX_MAX_CLIENTS; i++) {
@@ -1411,10 +1372,6 @@ int helix_frame_export_init(void *virtio_gpu, int vsock_port)
 
     /* Set global singleton */
     g_helix_export = fe;
-
-    /* Create BH for deferred gl_block(false) — matches SPICE's pattern.
-     * Scheduled from VT encode callback, fires on main thread. */
-    fe->gl_unblock_bh = helix_create_gl_unblock_bh(virtio_gpu);
 
     /* Set up TCP socket listener */
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
