@@ -407,6 +407,7 @@ static void scanout_encoder_callback(void *outputCallbackRefCon,
     CMBlockBufferRef dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer);
     if (!dataBuffer) {
         free(sps_pps_data);
+        helix_atomic_store(&fe->scanout_encoders[scanout_id].vt_busy, false);
         return;
     }
 
@@ -414,6 +415,7 @@ static void scanout_encoder_callback(void *outputCallbackRefCon,
     char *dataPtr = NULL;
     if (CMBlockBufferGetDataPointer(dataBuffer, 0, NULL, &totalLength, &dataPtr) != noErr) {
         free(sps_pps_data);
+        helix_atomic_store(&fe->scanout_encoders[scanout_id].vt_busy, false);
         return;
     }
 
@@ -422,6 +424,7 @@ static void scanout_encoder_callback(void *outputCallbackRefCon,
     uint8_t *annexb_data = malloc(annexb_size);
     if (!annexb_data) {
         free(sps_pps_data);
+        helix_atomic_store(&fe->scanout_encoders[scanout_id].vt_busy, false);
         return;
     }
 
@@ -456,6 +459,7 @@ static void scanout_encoder_callback(void *outputCallbackRefCon,
     uint8_t *response = malloc(response_size);
     if (!response) {
         free(annexb_data);
+        helix_atomic_store(&fe->scanout_encoders[scanout_id].vt_busy, false);
         return;
     }
 
@@ -775,6 +779,7 @@ static IOSurfaceRef helix_gl_blit_frame(HelixFrameExport *fe, uint32_t scanout_i
     /* Make our EGL context current */
     if (!eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
                         (EGLContext)fe->helix_egl_ctx)) {
+        eglMakeCurrent(qemu_egl_display, saved_draw, saved_read, saved_ctx);
         return NULL;
     }
 
@@ -826,6 +831,11 @@ static int create_scanout_encoder(HelixFrameExport *fe, uint32_t scanout_id,
 {
     if (scanout_id >= HELIX_MAX_SCANOUTS) return -1;
 
+    /* Serialize encoder creation — called from both the main loop
+     * (resolution change) and client handler threads (CONFIG_REQ).
+     * Without this, concurrent calls could double-free the VT session. */
+    pthread_mutex_lock(&fe->mutex);
+
     HelixScanoutEncoder *enc = &fe->scanout_encoders[scanout_id];
 
     /* Clean up existing session */
@@ -866,6 +876,7 @@ static int create_scanout_encoder(HelixFrameExport *fe, uint32_t scanout_id,
     if (status != noErr) {
         helix_log("[HELIX] VTCompressionSessionCreate failed for scanout %u: %d",
                   scanout_id, (int)status);
+        pthread_mutex_unlock(&fe->mutex);
         return -1;
     }
 
@@ -912,6 +923,7 @@ static int create_scanout_encoder(HelixFrameExport *fe, uint32_t scanout_id,
                   scanout_id, (int)status);
         CFRelease(enc->session);
         enc->session = NULL;
+        pthread_mutex_unlock(&fe->mutex);
         return -1;
     }
 
@@ -922,6 +934,7 @@ static int create_scanout_encoder(HelixFrameExport *fe, uint32_t scanout_id,
 
     helix_log("[HELIX] Created encoder for scanout %u: %dx%d bitrate=%d",
               scanout_id, width, height, effective_bitrate);
+    pthread_mutex_unlock(&fe->mutex);
     return 0;
 }
 
@@ -1379,8 +1392,12 @@ static void *multi_accept_thread(void *arg)
          * O_NONBLOCK is the only reliable way to get non-blocking sends.
          * read_exact_bytes() uses poll() to handle the non-blocking reads. */
         int flags = fcntl(client_fd, F_GETFL, 0);
-        if (flags >= 0) {
-            fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
+        if (flags < 0 || fcntl(client_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+            helix_log("[HELIX] CRITICAL: fcntl O_NONBLOCK failed (fd=%d): %s — "
+                      "rejecting client to prevent potential deadlock",
+                      client_fd, strerror(errno));
+            close(client_fd);
+            continue;
         }
 
         int client_idx = helix_add_client(fe, client_fd);
@@ -1391,6 +1408,11 @@ static void *multi_accept_thread(void *arg)
         }
 
         ClientThreadArg *cta = malloc(sizeof(ClientThreadArg));
+        if (!cta) {
+            helix_log("[HELIX] Failed to allocate client thread arg");
+            helix_remove_client(fe, client_idx);
+            continue;
+        }
         cta->fe = fe;
         cta->client_idx = client_idx;
 
@@ -1446,7 +1468,7 @@ void helix_frame_export_cleanup(HelixFrameExport *fe)
 int helix_frame_export_init(void *virtio_gpu, int vsock_port)
 {
     helix_log("========================================");
-    helix_log("[HELIX] VERSION: 2026-02-08-v7-gpu-blit");
+    helix_log("[HELIX] VERSION: 2026-02-10-v8-nonblock-vtbusy");
     helix_log("[HELIX] BUILD: Multi-client, per-scanout auto-encode");
     helix_log("========================================");
     helix_log("[HELIX] Initializing frame export on vsock port %d", vsock_port);
