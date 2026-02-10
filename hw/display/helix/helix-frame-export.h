@@ -160,6 +160,7 @@ typedef struct HelixScanoutEncoder {
     uint32_t blit_src_fbo;       /* Shared FBO for reading virgl texture */
     uint32_t blit_ring_idx;      /* Next ring slot to write */
     volatile bool blit_slot_busy[HELIX_BLIT_RING_SIZE]; /* VT encoding in progress */
+    volatile bool vt_busy;       /* VT has a frame in flight (prevents EncodeFrame from blocking main loop) */
     int32_t blit_width;
     int32_t blit_height;
 

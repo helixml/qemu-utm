@@ -33,6 +33,8 @@ void helix_schedule_gl_unblock(void *bh);
 #include <errno.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <fcntl.h>
+#include <poll.h>
 
 /* virglrenderer includes */
 #include "virglrenderer.h"
@@ -172,18 +174,80 @@ static void helix_log(const char *fmt, ...) {
 static void helix_destroy_scanout_blit(HelixFrameExport *fe, uint32_t scanout_id);
 
 /*
- * Read exactly n bytes from socket
+ * Read exactly n bytes from a non-blocking socket.
+ * Uses poll() to wait for data, since the socket is O_NONBLOCK
+ * (required for reliable non-blocking send on macOS — MSG_DONTWAIT
+ * is unreliable and can block in __sendto on closing sockets).
  */
 static bool read_exact_bytes(int fd, void *buf, size_t n)
 {
     size_t total = 0;
     while (total < n) {
         ssize_t r = recv(fd, (uint8_t *)buf + total, n - total, 0);
-        if (r <= 0) {
-            if (r < 0 && errno == EINTR) continue;
+        if (r > 0) {
+            total += r;
+            continue;
+        }
+        if (r == 0) {
+            return false;  /* EOF — peer closed */
+        }
+        /* r < 0 */
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            /* Socket is O_NONBLOCK — wait for data with poll().
+             * 600s matches the old SO_RCVTIMEO value. */
+            struct pollfd pfd = { .fd = fd, .events = POLLIN };
+            int ret = poll(&pfd, 1, 600 * 1000);
+            if (ret <= 0) {
+                return false;  /* Timeout or error */
+            }
+            if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                return false;  /* Socket error */
+            }
+            continue;  /* Data available, retry recv */
+        }
+        return false;  /* Other error */
+    }
+    return true;
+}
+
+/*
+ * Send exactly n bytes on a non-blocking socket, using poll() to wait.
+ * Used for control-plane messages (SUBSCRIBE_RESP, SCANOUT_RESP, PONG)
+ * that MUST be delivered for the protocol to work.
+ * Returns true on success, false on error/timeout.
+ */
+static bool send_exact_bytes(int fd, const void *buf, size_t n)
+{
+    size_t total = 0;
+    while (total < n) {
+        ssize_t sent = send(fd, (const uint8_t *)buf + total, n - total, 0);
+        if (sent > 0) {
+            total += sent;
+            continue;
+        }
+        if (sent == 0) {
             return false;
         }
-        total += r;
+        /* sent < 0 */
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            /* Wait up to 10 seconds for socket to become writable */
+            struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+            int ret = poll(&pfd, 1, 10 * 1000);
+            if (ret <= 0) {
+                return false;  /* Timeout or error */
+            }
+            if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                return false;
+            }
+            continue;  /* Socket writable, retry send */
+        }
+        return false;  /* Other error (EPIPE, ECONNRESET, etc.) */
     }
     return true;
 }
@@ -214,24 +278,31 @@ static void helix_send_to_subscribed_clients(HelixFrameExport *fe,
         pthread_mutex_lock(&c->send_lock);
         /* Non-blocking send — if TCP buffer is full, drop the entire
          * frame for this client rather than blocking the VT callback
-         * thread. Partial sends are treated as drops to avoid sending
-         * corrupt H.264 NALs that would break the decoder. */
+         * thread. Partial sends permanently desync the TCP stream
+         * (client reads garbage until next magic match), so we close
+         * the connection to force a clean reconnect. */
         ssize_t sent = send(c->fd, response_data, response_size,
                             MSG_DONTWAIT);
+        bool should_disconnect = false;
         if (sent < 0) {
             if (errno != EAGAIN && errno != EWOULDBLOCK) {
                 helix_log("[HELIX] Send error client %d (scanout %u): %s",
                           i, scanout_id, strerror(errno));
+                should_disconnect = true;
             }
         } else if ((size_t)sent != response_size) {
-            static uint64_t partial_count = 0;
-            if (++partial_count <= 5 || (partial_count % 500) == 0) {
-                helix_log("[HELIX] Partial send to client %d: %zd/%zu bytes "
-                          "(frame dropped #%llu)", i, sent, response_size,
-                          partial_count);
-            }
+            helix_log("[HELIX] Partial send to client %d: %zd/%zu bytes — "
+                      "closing to prevent stream corruption", i, sent,
+                      response_size);
+            should_disconnect = true;
         }
         pthread_mutex_unlock(&c->send_lock);
+
+        if (should_disconnect) {
+            /* Shutdown the socket — client handler thread will detect
+             * the error on its next recv() and clean up properly. */
+            shutdown(c->fd, SHUT_RDWR);
+        }
     }
     pthread_mutex_unlock(&fe->clients_lock);
 }
@@ -261,13 +332,19 @@ static void scanout_encoder_callback(void *outputCallbackRefCon,
     uintptr_t ref = (uintptr_t)sourceFrameRefCon;
     uint32_t slot = ref & 0xFF;
 
-    /* Mark ring slot as free — VT is done with this IOSurface */
+    /* Mark ring slot as free — VT is done with this IOSurface.
+     * Clear slot_busy BEFORE vt_busy so the main thread never sees
+     * vt_busy=false while slot_busy is still true. */
     if (slot < HELIX_BLIT_RING_SIZE && scanout_id < HELIX_MAX_SCANOUTS) {
         helix_atomic_store(&fe->scanout_encoders[scanout_id].blit_slot_busy[slot], false);
     }
 
     if (status != noErr || !sampleBuffer) {
         fe->encode_errors++;
+        /* Clear vt_busy even on error — otherwise the encoder is stuck forever */
+        if (scanout_id < HELIX_MAX_SCANOUTS) {
+            helix_atomic_store(&fe->scanout_encoders[scanout_id].vt_busy, false);
+        }
         return;
     }
 
@@ -407,6 +484,10 @@ static void scanout_encoder_callback(void *outputCallbackRefCon,
 
     fe->frames_encoded++;
     free(response);
+
+    /* Clear vt_busy AFTER sending — main thread won't submit next frame
+     * until we're fully done with this one. */
+    helix_atomic_store(&fe->scanout_encoders[scanout_id].vt_busy, false);
 }
 
 /* Per-scanout encoder context storage (leaked intentionally - lives for process lifetime) */
@@ -643,6 +724,7 @@ static void helix_destroy_scanout_blit(HelixFrameExport *fe, uint32_t scanout_id
     }
 
     enc->blit_ring_idx = 0;
+    helix_atomic_store(&enc->vt_busy, false);
     for (int i = 0; i < HELIX_BLIT_RING_SIZE; i++) {
         helix_atomic_store(&enc->blit_slot_busy[i], false);
     }
@@ -947,14 +1029,31 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
         }
     }
 
+    /* Check if VT is still processing the previous frame.
+     * With MaxFrameDelayCount=0, VTCompressionSessionEncodeFrame BLOCKS
+     * until the previous callback completes. If we called EncodeFrame
+     * while VT is busy, the QEMU main loop would freeze — killing SSH,
+     * console, everything. Instead, we drop the frame pre-encode.
+     * This is the PRIMARY defense against main loop hangs. */
+    if (helix_atomic_load(&enc->vt_busy)) {
+        static uint64_t vt_busy_drops = 0;
+        vt_busy_drops++;
+        if (vt_busy_drops <= 5 || (vt_busy_drops % 500) == 0) {
+            helix_log("[FRAME_READY] Dropping frame — VT still processing "
+                      "previous frame (dropped %llu total)", vt_busy_drops);
+        }
+        return;
+    }
+
     /* Select ring slot and advance index (both done here so they stay
      * in sync — the blit function uses the slot we chose). */
     uint32_t slot = enc->blit_ring_idx;
     enc->blit_ring_idx = (slot + 1) % HELIX_BLIT_RING_SIZE;
 
     /* If this slot is still being encoded by VT, drop the frame.
-     * Per-scanout backpressure: each scanout has its own ring, so one
-     * slow scanout only drops its own frames, not other scanouts'. */
+     * Secondary safety net — with vt_busy check above, this should
+     * rarely trigger. Per-scanout: one slow scanout only drops its
+     * own frames, not other scanouts'. */
     if (helix_atomic_load(&enc->blit_slot_busy[slot])) {
         static uint64_t backpressure_drops = 0;
         backpressure_drops++;
@@ -1013,9 +1112,13 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
                              kCFBooleanTrue);
     }
 
-    /* Mark ring slot as busy and submit to VT.
-     * Pass slot index in sourceFrameRefCon (low 8 bits). */
+    /* Mark ring slot as busy and VT as in-flight, then submit.
+     * Pass slot index in sourceFrameRefCon (low 8 bits).
+     * vt_busy MUST be set BEFORE EncodeFrame — it prevents the next
+     * helix_scanout_frame_ready from calling EncodeFrame while VT is
+     * processing, which would block the QEMU main loop. */
     helix_atomic_store(&enc->blit_slot_busy[slot], true);
+    helix_atomic_store(&enc->vt_busy, true);
 
     OSStatus encStatus = VTCompressionSessionEncodeFrame(
         enc->session, pixelBuffer, cmPts, cmDuration,
@@ -1028,8 +1131,9 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
     }
 
     if (encStatus != noErr) {
-        /* Encode failed — callback won't fire, so clear busy flag */
+        /* Encode failed — callback won't fire, so clear busy flags */
         helix_atomic_store(&enc->blit_slot_busy[slot], false);
+        helix_atomic_store(&enc->vt_busy, false);
     }
 
     if (frameProps) CFRelease(frameProps);
@@ -1145,8 +1249,12 @@ static void *client_handler_thread(void *arg)
             resp_data[1] = 1;  /* success */
 
             pthread_mutex_lock(&fe->clients[client_idx].send_lock);
-            send(client_fd, resp_buf, sizeof(resp_buf), 0);
+            bool ok = send_exact_bytes(client_fd, resp_buf, sizeof(resp_buf));
             pthread_mutex_unlock(&fe->clients[client_idx].send_lock);
+            if (!ok) {
+                helix_log("[HELIX] Client %d: failed to send SUBSCRIBE_RESP", client_idx);
+                break;
+            }
 
         } else if (header.msg_type == HELIX_MSG_ENABLE_SCANOUT) {
             uint32_t payload[4];
@@ -1168,8 +1276,12 @@ static void *client_handler_thread(void *arg)
             snprintf((char *)(resp_data + 2), 64, "Virtual-%u", payload[0] + 1);
 
             pthread_mutex_lock(&fe->clients[client_idx].send_lock);
-            send(client_fd, resp_buf, sizeof(resp_buf), 0);
+            bool ok = send_exact_bytes(client_fd, resp_buf, sizeof(resp_buf));
             pthread_mutex_unlock(&fe->clients[client_idx].send_lock);
+            if (!ok) {
+                helix_log("[HELIX] Client %d: failed to send SCANOUT_RESP", client_idx);
+                break;
+            }
 
         } else if (header.msg_type == HELIX_MSG_DISABLE_SCANOUT) {
             uint32_t scanout_id;
@@ -1184,8 +1296,12 @@ static void *client_handler_thread(void *arg)
                 .payload_size = 0
             };
             pthread_mutex_lock(&fe->clients[client_idx].send_lock);
-            send(client_fd, &pong, sizeof(pong), 0);
+            bool ok = send_exact_bytes(client_fd, &pong, sizeof(pong));
             pthread_mutex_unlock(&fe->clients[client_idx].send_lock);
+            if (!ok) {
+                helix_log("[HELIX] Client %d: failed to send PONG", client_idx);
+                break;
+            }
 
         } else if (header.msg_type == HELIX_MSG_CONFIG_REQ) {
             /* Per-scanout bitrate configuration from client */
@@ -1257,8 +1373,15 @@ static void *multi_accept_thread(void *arg)
         setsockopt(client_fd, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, sizeof(nosigpipe));
 #endif
 
-        struct timeval tv = { .tv_sec = 600, .tv_usec = 0 };
-        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        /* Set socket to O_NONBLOCK — CRITICAL for macOS.
+         * MSG_DONTWAIT is unreliable on macOS: send() can block in __sendto
+         * even with MSG_DONTWAIT on sockets in closing/half-open states.
+         * O_NONBLOCK is the only reliable way to get non-blocking sends.
+         * read_exact_bytes() uses poll() to handle the non-blocking reads. */
+        int flags = fcntl(client_fd, F_GETFL, 0);
+        if (flags >= 0) {
+            fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
+        }
 
         int client_idx = helix_add_client(fe, client_fd);
         if (client_idx < 0) {
@@ -1360,6 +1483,7 @@ int helix_frame_export_init(void *virtio_gpu, int vsock_port)
         fe->scanout_encoders[i].blit_ring_idx = 0;
         fe->scanout_encoders[i].blit_width = 0;
         fe->scanout_encoders[i].blit_height = 0;
+        helix_atomic_store(&fe->scanout_encoders[i].vt_busy, false);
         for (int j = 0; j < HELIX_BLIT_RING_SIZE; j++) {
             fe->scanout_encoders[i].blit_surfaces[j] = NULL;
             fe->scanout_encoders[i].blit_egl_surfaces[j] = NULL;
@@ -1370,10 +1494,9 @@ int helix_frame_export_init(void *virtio_gpu, int vsock_port)
         fe->scanout_encoders[i].blit_src_fbo = 0;
     }
 
-    /* Set global singleton */
-    g_helix_export = fe;
-
-    /* Set up TCP socket listener */
+    /* Set up TCP socket listener (BEFORE setting g_helix_export — if
+     * setup fails and we free fe, g_helix_export must not point at
+     * freed memory or helix_scanout_frame_ready will use-after-free) */
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
         error_report("Failed to create TCP socket: %s", strerror(errno));
@@ -1419,6 +1542,11 @@ int helix_frame_export_init(void *virtio_gpu, int vsock_port)
         return -1;
     }
     pthread_detach(thread);
+
+    /* Set global singleton LAST — after all setup succeeds. If we set it
+     * earlier and setup fails, helix_scanout_frame_ready would dereference
+     * freed memory on every page flip. */
+    g_helix_export = fe;
 
     return 0;
 }
