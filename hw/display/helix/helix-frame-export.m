@@ -471,6 +471,26 @@ static int create_encoder_session(HelixFrameExport *fe,
                              kVTCompressionPropertyKey_AllowFrameReordering,
                              kCFBooleanFalse);
 
+        /* Force one-in-one-out: encoder must produce output for each input
+         * before accepting another frame. Without this, VT can internally
+         * buffer frames for better compression, causing P-frame decode issues. */
+        int maxFrameDelay = 0;
+        CFNumberRef maxFrameDelayRef = CFNumberCreate(
+            kCFAllocatorDefault, kCFNumberIntType, &maxFrameDelay);
+        VTSessionSetProperty(fe->encoder_session,
+                             kVTCompressionPropertyKey_MaxFrameDelayCount,
+                             maxFrameDelayRef);
+        CFRelease(maxFrameDelayRef);
+
+        /* Tell VT our target frame rate for better rate control */
+        int expectedFPS = 60;
+        CFNumberRef expectedFPSRef = CFNumberCreate(
+            kCFAllocatorDefault, kCFNumberIntType, &expectedFPS);
+        VTSessionSetProperty(fe->encoder_session,
+                             kVTCompressionPropertyKey_ExpectedFrameRate,
+                             expectedFPSRef);
+        CFRelease(expectedFPSRef);
+
         /* Max keyframe interval (1 per second at 60fps) */
         int maxKeyFrameInterval = 60;
         CFNumberRef maxKeyFrameIntervalRef = CFNumberCreate(
@@ -491,10 +511,11 @@ static int create_encoder_session(HelixFrameExport *fe,
         CFRelease(bitrateRef);
     }
 
-    /* H.264 Baseline Profile for low-latency streaming (no B-frames) */
+    /* H.264 Constrained Baseline — matches what the SPS rewriter and
+     * browser decoder expect (avc1.42d028, constraint_set3_flag=1). */
     VTSessionSetProperty(fe->encoder_session,
                          kVTCompressionPropertyKey_ProfileLevel,
-                         kVTProfileLevel_H264_Baseline_AutoLevel);
+                         kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel);
 
     /* Prepare to encode */
     status = VTCompressionSessionPrepareToEncodeFrames(fe->encoder_session);
@@ -2160,6 +2181,18 @@ static int create_scanout_encoder(HelixFrameExport *fe, uint32_t scanout_id,
     VTSessionSetProperty(enc->session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
     VTSessionSetProperty(enc->session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
 
+    /* Force one-in-one-out encoding */
+    int maxFrameDelay = 0;
+    CFNumberRef maxFrameDelayRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &maxFrameDelay);
+    VTSessionSetProperty(enc->session, kVTCompressionPropertyKey_MaxFrameDelayCount, maxFrameDelayRef);
+    CFRelease(maxFrameDelayRef);
+
+    /* Target frame rate for rate control */
+    int expectedFPS = 60;
+    CFNumberRef expectedFPSRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &expectedFPS);
+    VTSessionSetProperty(enc->session, kVTCompressionPropertyKey_ExpectedFrameRate, expectedFPSRef);
+    CFRelease(expectedFPSRef);
+
     int maxKeyFrame = 60;
     CFNumberRef maxKeyFrameRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &maxKeyFrame);
     VTSessionSetProperty(enc->session, kVTCompressionPropertyKey_MaxKeyFrameInterval, maxKeyFrameRef);
@@ -2176,8 +2209,10 @@ static int create_scanout_encoder(HelixFrameExport *fe, uint32_t scanout_id,
     VTSessionSetProperty(enc->session, kVTCompressionPropertyKey_AverageBitRate, bitrateRef);
     CFRelease(bitrateRef);
 
+    /* H.264 Constrained Baseline — matches what the SPS rewriter and
+     * browser decoder expect (avc1.42d028, constraint_set3_flag=1). */
     VTSessionSetProperty(enc->session, kVTCompressionPropertyKey_ProfileLevel,
-                         kVTProfileLevel_H264_Baseline_AutoLevel);
+                         kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel);
 
     status = VTCompressionSessionPrepareToEncodeFrames(enc->session);
     if (status != noErr) {
@@ -2359,18 +2394,17 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
     CMTime cmPts = CMTimeMake(pts, 1000000000);
     CMTime cmDuration = CMTimeMake(16666667, 1000000000);
 
-    /* Force every frame as keyframe for diagnostic.
-     * If corruption goes away: the issue is P-frame prediction referencing
-     * a previously corrupt frame (one bad blit propagates via inter-frame).
-     * If corruption persists: the issue is in the blit/pixel data itself.
-     * TODO: revert to keyframe-on-first-frame once corruption is resolved. */
-    CFMutableDictionaryRef frameProps = CFDictionaryCreateMutable(
-        kCFAllocatorDefault, 1,
-        &kCFTypeDictionaryKeyCallBacks,
-        &kCFTypeDictionaryValueCallBacks);
-    CFDictionarySetValue(frameProps,
-                         kVTEncodeFrameOptionKey_ForceKeyFrame,
-                         kCFBooleanTrue);
+    /* Force keyframe on first frame only */
+    CFMutableDictionaryRef frameProps = NULL;
+    if (enc->frame_count == 1) {
+        frameProps = CFDictionaryCreateMutable(
+            kCFAllocatorDefault, 1,
+            &kCFTypeDictionaryKeyCallBacks,
+            &kCFTypeDictionaryValueCallBacks);
+        CFDictionarySetValue(frameProps,
+                             kVTEncodeFrameOptionKey_ForceKeyFrame,
+                             kCFBooleanTrue);
+    }
 
     /* Encode — async. VT calls scanout_encoder_callback on completion,
      * which schedules the BH to call gl_block(false). If EncodeFrame
