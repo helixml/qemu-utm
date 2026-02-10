@@ -15,7 +15,6 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include <stdatomic.h>
 
 #ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h>
@@ -213,11 +212,6 @@ typedef struct HelixFrameExport {
     /* Bottom-half for deferred gl_block(false) — matches SPICE's pattern.
      * Created in init, scheduled from VT encode callback (thread-safe). */
     void *gl_unblock_bh;            /* QEMUBH* */
-
-    /* Safety mechanism: prevents permanent gl_block(true) if VT callback
-     * never fires (e.g., client disconnected during encode). Only one of
-     * {callback, safety timer} can schedule the unblock BH. */
-    atomic_bool gl_block_pending;
 
 } HelixFrameExport;
 
