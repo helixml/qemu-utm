@@ -18,6 +18,12 @@ void helix_gl_block(void *virtio_gpu, bool block);
 void *helix_create_gl_unblock_bh(void *virtio_gpu);
 void helix_schedule_gl_unblock(void *bh);
 
+/* BQL (Big QEMU Lock) — must be held when calling QEMU device model
+ * functions from non-main threads. Can't include qemu/main-loop.h
+ * from Objective-C due to header conflicts, so declare directly. */
+void bql_lock_impl(const char *file, int line);
+void bql_unlock(void);
+
 #ifdef __APPLE__
 
 #include <dispatch/dispatch.h>
@@ -197,9 +203,10 @@ static bool read_exact_bytes(int fd, void *buf, size_t n)
         }
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             /* Socket is O_NONBLOCK — wait for data with poll().
-             * 600s matches the old SO_RCVTIMEO value. */
+             * 60s timeout: if client is silent for this long, the
+             * connection is dead. Frees the client slot promptly. */
             struct pollfd pfd = { .fd = fd, .events = POLLIN };
-            int ret = poll(&pfd, 1, 600 * 1000);
+            int ret = poll(&pfd, 1, 60 * 1000);
             if (ret <= 0) {
                 return false;  /* Timeout or error */
             }
@@ -1273,8 +1280,13 @@ static void *client_handler_thread(void *arg)
             uint32_t payload[4];
             if (!read_exact_bytes(client_fd, payload, 16)) break;
 
+            /* Must hold BQL when calling QEMU device model functions
+             * from a non-main thread. helix_enable_scanout modifies
+             * virtio-gpu scanout state and calls graphic_console_init. */
+            bql_lock_impl(__FILE__, __LINE__);
             int result = helix_enable_scanout(fe->virtio_gpu, payload[0],
                                               payload[1], payload[2]);
+            bql_unlock();
 
             uint8_t resp_buf[sizeof(HelixMsgHeader) + 72];
             memset(resp_buf, 0, sizeof(resp_buf));
@@ -1299,7 +1311,9 @@ static void *client_handler_thread(void *arg)
         } else if (header.msg_type == HELIX_MSG_DISABLE_SCANOUT) {
             uint32_t scanout_id;
             if (!read_exact_bytes(client_fd, &scanout_id, 4)) break;
+            bql_lock_impl(__FILE__, __LINE__);
             helix_disable_scanout(fe->virtio_gpu, scanout_id);
+            bql_unlock();
 
         } else if (header.msg_type == HELIX_MSG_PING) {
             HelixMsgHeader pong = {
