@@ -437,9 +437,11 @@ static void scanout_encoder_callback(void *outputCallbackRefCon,
 
     size_t src_offset = 0, dst_offset = 0;
 
-    if (sps_pps_data && sps_pps_size > 0) {
-        memcpy(annexb_data, sps_pps_data, sps_pps_size);
-        dst_offset = sps_pps_size;
+    if (sps_pps_data) {
+        if (sps_pps_size > 0) {
+            memcpy(annexb_data, sps_pps_data, sps_pps_size);
+            dst_offset = sps_pps_size;
+        }
         free(sps_pps_data);
         sps_pps_data = NULL;
     }
@@ -1132,6 +1134,22 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
                              kCFBooleanTrue);
     }
 
+    /* Hold fe->mutex during EncodeFrame to prevent a TOCTOU race:
+     * without this, a client handler's CONFIG_REQ could call
+     * create_scanout_encoder which invalidates and CFReleases the old
+     * session between our read of enc->session and the EncodeFrame call.
+     * Since vt_busy=false guarantees VT's queue is empty,
+     * EncodeFrame returns in microseconds — no main loop stall. */
+    pthread_mutex_lock(&fe->mutex);
+
+    if (!enc->session) {
+        /* Encoder was torn down between our check and the lock */
+        pthread_mutex_unlock(&fe->mutex);
+        if (frameProps) CFRelease(frameProps);
+        CVPixelBufferRelease(pixelBuffer);
+        return;
+    }
+
     /* Mark ring slot as busy and VT as in-flight, then submit.
      * Pass slot index in sourceFrameRefCon (low 8 bits).
      * vt_busy MUST be set BEFORE EncodeFrame — it prevents the next
@@ -1143,6 +1161,8 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
     OSStatus encStatus = VTCompressionSessionEncodeFrame(
         enc->session, pixelBuffer, cmPts, cmDuration,
         frameProps, (void *)(uintptr_t)slot, NULL);
+
+    pthread_mutex_unlock(&fe->mutex);
 
     if (enc->frame_count <= 5 || (enc->frame_count % 100) == 0) {
         helix_log("[ENCODE] scanout=%u frame=%lld slot=%u status=%d %ux%u",
