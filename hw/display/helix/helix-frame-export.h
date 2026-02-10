@@ -15,7 +15,6 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include <stdatomic.h>
 
 #ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h>
@@ -160,7 +159,7 @@ typedef struct HelixScanoutEncoder {
     uint32_t blit_fbos[HELIX_BLIT_RING_SIZE];         /* GL FBO per slot (write) */
     uint32_t blit_src_fbo;       /* Shared FBO for reading virgl texture */
     uint32_t blit_ring_idx;      /* Next ring slot to write */
-    atomic_bool blit_slot_busy[HELIX_BLIT_RING_SIZE]; /* VT encoding in progress */
+    volatile bool blit_slot_busy[HELIX_BLIT_RING_SIZE]; /* VT encoding in progress */
     int32_t blit_width;
     int32_t blit_height;
 
@@ -174,27 +173,12 @@ typedef struct HelixFrameExport {
     pthread_mutex_t mutex;
     bool valid;
 
-    /* Legacy single-client encoder (scanout 0 / pixel data mode) */
-    VTCompressionSessionRef encoder_session;
-    int32_t width;
-    int32_t height;
-    int32_t bitrate;
-    bool realtime;
-    bool configured;
-
-    /* Legacy vsock connection (backward compat) */
-    int vsock_fd;
-    uint16_t session_id;
-
     /* Multi-scanout encoders */
     HelixScanoutEncoder scanout_encoders[HELIX_MAX_SCANOUTS];
 
     /* Multi-client connections */
     HelixClient clients[HELIX_MAX_CLIENTS];
     pthread_mutex_t clients_lock;
-
-    /* Pending frame response queue */
-    void *response_queue;  /* dispatch_queue_t */
 
     /* Statistics */
     uint64_t frames_encoded;
@@ -215,6 +199,10 @@ typedef struct HelixFrameExport {
      * Created in init, scheduled from VT encode callback (thread-safe). */
     void *gl_unblock_bh;            /* QEMUBH* */
 
+    /* Safety mechanism: prevents permanent gl_block(true) if VT callback
+     * never fires (e.g., client disconnected during encode). */
+    volatile bool gl_block_pending;
+
 } HelixFrameExport;
 
 /*
@@ -227,47 +215,6 @@ int helix_frame_export_init(void *virtio_gpu, int vsock_port);
  * Cleanup frame export
  */
 void helix_frame_export_cleanup(HelixFrameExport *fe);
-
-/*
- * Process incoming message from guest
- */
-int helix_frame_export_process_msg(HelixFrameExport *fe,
-                                    const uint8_t *data,
-                                    size_t len);
-
-/*
- * Look up IOSurface for a virtio-gpu resource
- * Returns IOSurfaceRef (retained) or NULL
- */
-IOSurfaceRef helix_get_iosurface_for_resource(void *virtio_gpu,
-                                               uint32_t resource_id);
-
-/*
- * Get IOSurface from scanout DisplaySurface (safe, no race condition)
- * Returns IOSurfaceRef (retained) or NULL
- */
-IOSurfaceRef helix_get_iosurface_from_scanout(void *virtio_gpu,
-                                                uint32_t scanout_id);
-
-/*
- * Get DisplaySurface pixel data (implemented in virtio-gpu-virgl.c)
- * Returns true if successful, false if DisplaySurface not available
- */
-bool virtio_gpu_get_scanout_surface_data(void *virtio_gpu,
-                                          uint32_t scanout_idx,
-                                          uint32_t *width,
-                                          uint32_t *height,
-                                          uint32_t *stride,
-                                          void **data);
-
-/*
- * Encode an IOSurface frame
- */
-int helix_encode_iosurface(HelixFrameExport *fe,
-                           IOSurfaceRef surface,
-                           int64_t pts,
-                           int64_t duration,
-                           bool force_keyframe);
 
 /*
  * Auto-encode a scanout frame on page flip (damage-based).
