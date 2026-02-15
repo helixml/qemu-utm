@@ -41,6 +41,7 @@ void bql_unlock(void);
 #include <stdarg.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <time.h>
 
 /* virglrenderer includes */
 #include "virglrenderer.h"
@@ -940,6 +941,8 @@ static int create_scanout_encoder(HelixFrameExport *fe, uint32_t scanout_id,
     enc->height = height;
     enc->bitrate = effective_bitrate;
     enc->configured = true;
+    enc->has_blitted_frame = false;
+    helix_atomic_store(&enc->last_frame_ns, (uint64_t)0);
 
     helix_log("[HELIX] Created encoder for scanout %u: %dx%d bitrate=%d",
               scanout_id, width, height, effective_bitrate);
@@ -1174,10 +1177,160 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
         /* Encode failed — callback won't fire, so clear busy flags */
         helix_atomic_store(&enc->blit_slot_busy[slot], false);
         helix_atomic_store(&enc->vt_busy, false);
+    } else {
+        /* Track last successful blit for keepalive re-encoding.
+         * The keepalive thread will re-submit this IOSurface when
+         * no page flips arrive for HELIX_KEEPALIVE_INTERVAL_MS. */
+        enc->last_blit_slot = slot;
+        enc->has_blitted_frame = true;
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        helix_atomic_store(&enc->last_frame_ns,
+            (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec);
     }
 
     if (frameProps) CFRelease(frameProps);
     CVPixelBufferRelease(pixelBuffer);
+}
+
+/* ========================================================================
+ * Frame keepalive thread
+ *
+ * When the guest screen is static, no resource_flush events are produced
+ * and the encoder goes idle. This thread periodically re-encodes the last
+ * IOSurface to produce valid H.264 frames for connected clients.
+ *
+ * Unlike re-sending already-encoded P-frames (which corrupts the decoder's
+ * reference picture list / DPB), this re-encodes from the raw pixel buffer,
+ * producing proper frame_num sequencing and correct reference lists.
+ * ======================================================================== */
+
+static void *helix_keepalive_thread(void *arg)
+{
+    HelixFrameExport *fe = (HelixFrameExport *)arg;
+    const uint64_t interval_ns = (uint64_t)HELIX_KEEPALIVE_INTERVAL_MS * 1000000ULL;
+    uint64_t keepalive_count = 0;
+
+    helix_log("[KEEPALIVE] Frame keepalive thread started (interval=%dms)",
+              HELIX_KEEPALIVE_INTERVAL_MS);
+
+    while (fe->valid) {
+        /* Sleep for half the interval to check more frequently than we fire.
+         * This gives ~250ms worst-case jitter on the keepalive. */
+        usleep(HELIX_KEEPALIVE_INTERVAL_MS * 500);  /* half interval in usec */
+
+        if (!fe->valid) break;
+
+        /* Get current time */
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        uint64_t now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+
+        /* Check each scanout */
+        for (uint32_t sid = 0; sid < HELIX_MAX_SCANOUTS; sid++) {
+            HelixScanoutEncoder *enc = &fe->scanout_encoders[sid];
+
+            /* Skip unconfigured scanouts or those without a blitted frame */
+            if (!enc->configured || !enc->has_blitted_frame || !enc->session) {
+                continue;
+            }
+
+            /* Check if enough time has elapsed since last frame */
+            uint64_t last_ns = helix_atomic_load(&enc->last_frame_ns);
+            if (last_ns == 0 || (now_ns - last_ns) < interval_ns) {
+                continue;
+            }
+
+            /* Check if any client is subscribed to this scanout */
+            bool has_subscriber = false;
+            pthread_mutex_lock(&fe->clients_lock);
+            for (int i = 0; i < HELIX_MAX_CLIENTS; i++) {
+                if (fe->clients[i].active && fe->clients[i].subscribed &&
+                    fe->clients[i].subscribed_scanout == sid) {
+                    has_subscriber = true;
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&fe->clients_lock);
+
+            if (!has_subscriber) {
+                continue;
+            }
+
+            /* Check VT isn't busy */
+            if (helix_atomic_load(&enc->vt_busy)) {
+                continue;
+            }
+
+            /* Re-encode the last blitted IOSurface.
+             * The IOSurface still holds the last raw frame content (static screen).
+             * We just wrap it as a new CVPixelBuffer and submit to VT. */
+            uint32_t slot = enc->last_blit_slot;
+            IOSurfaceRef surface = enc->blit_surfaces[slot];
+            if (!surface) {
+                continue;
+            }
+
+            /* Check the slot isn't still being used by VT */
+            if (helix_atomic_load(&enc->blit_slot_busy[slot])) {
+                continue;
+            }
+
+            /* Wrap IOSurface as CVPixelBuffer (zero-copy) */
+            CVPixelBufferRef pixelBuffer = NULL;
+            CVReturn cvRet = CVPixelBufferCreateWithIOSurface(
+                kCFAllocatorDefault, surface, NULL, &pixelBuffer);
+            if (cvRet != kCVReturnSuccess || !pixelBuffer) {
+                continue;
+            }
+
+            /* Generate monotonic PTS (continues from page-flip sequence) */
+            enc->frame_count++;
+            int64_t pts = enc->frame_count * 16666667;  /* ~60fps in nanoseconds */
+            CMTime cmPts = CMTimeMake(pts, 1000000000);
+            CMTime cmDuration = CMTimeMake(16666667, 1000000000);
+
+            /* Submit to VideoToolbox under mutex (same pattern as frame_ready) */
+            pthread_mutex_lock(&fe->mutex);
+            if (!enc->session) {
+                pthread_mutex_unlock(&fe->mutex);
+                CVPixelBufferRelease(pixelBuffer);
+                continue;
+            }
+
+            helix_atomic_store(&enc->blit_slot_busy[slot], true);
+            helix_atomic_store(&enc->vt_busy, true);
+
+            OSStatus encStatus = VTCompressionSessionEncodeFrame(
+                enc->session, pixelBuffer, cmPts, cmDuration,
+                NULL, (void *)(uintptr_t)slot, NULL);
+
+            pthread_mutex_unlock(&fe->mutex);
+
+            if (encStatus != noErr) {
+                helix_atomic_store(&enc->blit_slot_busy[slot], false);
+                helix_atomic_store(&enc->vt_busy, false);
+            } else {
+                /* Update last_frame_ns to prevent rapid re-firing */
+                struct timespec ts2;
+                clock_gettime(CLOCK_MONOTONIC, &ts2);
+                helix_atomic_store(&enc->last_frame_ns,
+                    (uint64_t)ts2.tv_sec * 1000000000ULL + (uint64_t)ts2.tv_nsec);
+            }
+
+            keepalive_count++;
+            if (keepalive_count == 1 || (keepalive_count % 120) == 0) {
+                helix_log("[KEEPALIVE] Re-encoded scanout %u from IOSurface "
+                          "(slot=%u, total keepalive frames=%llu)",
+                          sid, slot, keepalive_count);
+            }
+
+            CVPixelBufferRelease(pixelBuffer);
+        }
+    }
+
+    helix_log("[KEEPALIVE] Frame keepalive thread stopped");
+    return NULL;
 }
 
 /* ========================================================================
@@ -1502,8 +1655,8 @@ void helix_frame_export_cleanup(HelixFrameExport *fe)
 int helix_frame_export_init(void *virtio_gpu, int vsock_port)
 {
     helix_log("========================================");
-    helix_log("[HELIX] VERSION: 2026-02-15-v10-ipa-granule-test");
-    helix_log("[HELIX] BUILD: Multi-client, per-scanout auto-encode, assert(isv) restored");
+    helix_log("[HELIX] VERSION: 2026-02-15-v11-keepalive-isv-fix");
+    helix_log("[HELIX] BUILD: Multi-client, per-scanout auto-encode, IOSurface keepalive, ISV fix");
     helix_log("========================================");
     helix_log("[HELIX] Initializing frame export on vsock port %d", vsock_port);
 
@@ -1548,6 +1701,9 @@ int helix_frame_export_init(void *virtio_gpu, int vsock_port)
             helix_atomic_store(&fe->scanout_encoders[i].blit_slot_busy[j], false);
         }
         fe->scanout_encoders[i].blit_src_fbo = 0;
+        fe->scanout_encoders[i].last_blit_slot = 0;
+        fe->scanout_encoders[i].has_blitted_frame = false;
+        helix_atomic_store(&fe->scanout_encoders[i].last_frame_ns, (uint64_t)0);
     }
 
     /* Set up TCP socket listener (BEFORE setting g_helix_export — if
@@ -1598,6 +1754,16 @@ int helix_frame_export_init(void *virtio_gpu, int vsock_port)
         return -1;
     }
     pthread_detach(thread);
+
+    /* Start frame keepalive thread — re-encodes last IOSurface on static screens */
+    pthread_t keepalive_thread;
+    if (pthread_create(&keepalive_thread, NULL, helix_keepalive_thread, fe) != 0) {
+        error_report("[HELIX] WARNING: Failed to create keepalive thread: %s "
+                     "(static screens will not produce frames)", strerror(errno));
+        /* Non-fatal — everything still works, just no keepalive frames */
+    } else {
+        pthread_detach(keepalive_thread);
+    }
 
     /* Set global singleton LAST — after all setup succeeds. If we set it
      * earlier and setup fails, helix_scanout_frame_ready would dereference
