@@ -215,6 +215,8 @@ struct VirtIOGPU {
     } dmabuf;
 
     GArray *capset_ids;
+
+    uint32_t helix_port; /* TCP port for Helix frame export (0 = disabled) */
 };
 
 struct VirtIOGPUClass {

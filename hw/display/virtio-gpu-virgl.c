@@ -1460,7 +1460,9 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
     }
 
     /* Initialize Helix frame export for zero-copy GPU frame sharing */
-    helix_frame_export_init(g, 15937); /* TCP port for frame export */
+    if (g->helix_port > 0) {
+        helix_frame_export_init(g, g->helix_port);
+    }
 
     gl->fence_poll = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                   virtio_gpu_fence_poll, g);

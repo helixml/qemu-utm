@@ -1502,8 +1502,8 @@ void helix_frame_export_cleanup(HelixFrameExport *fe)
 int helix_frame_export_init(void *virtio_gpu, int vsock_port)
 {
     helix_log("========================================");
-    helix_log("[HELIX] VERSION: 2026-02-10-v8-nonblock-vtbusy");
-    helix_log("[HELIX] BUILD: Multi-client, per-scanout auto-encode");
+    helix_log("[HELIX] VERSION: 2026-02-15-v9-isv-fix");
+    helix_log("[HELIX] BUILD: Multi-client, per-scanout auto-encode, ISV data-abort fix");
     helix_log("========================================");
     helix_log("[HELIX] Initializing frame export on vsock port %d", vsock_port);
 
