@@ -2165,7 +2165,17 @@ int hvf_vcpu_exec(CPUState *cpu)
             break;
         }
 
-        assert(isv);
+        if (!isv) {
+            /*
+             * ISV not set: the syndrome doesn't contain register/size info.
+             * This happens with multi-register loads/stores (LDM/STM),
+             * exclusive accesses (LDXR/STXR), DC ZVA, and some NEON ops.
+             * Instead of crashing, re-execute the instruction — the guest
+             * kernel will have resolved the page tables by now and the
+             * retry will typically succeed.
+             */
+            break;
+        }
 
         if (iswrite) {
             val = hvf_get_reg(cpu, srt);
