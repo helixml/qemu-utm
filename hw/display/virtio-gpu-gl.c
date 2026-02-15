@@ -185,6 +185,7 @@ static const Property virtio_gpu_gl_properties[] = {
                     VIRTIO_GPU_FLAG_STATS_ENABLED, false),
     DEFINE_PROP_BIT("venus", VirtIOGPU, parent_obj.conf.flags,
                     VIRTIO_GPU_FLAG_VENUS_ENABLED, false),
+    DEFINE_PROP_UINT32("helix-port", VirtIOGPU, helix_port, 15937),
 };
 
 static void virtio_gpu_gl_device_unrealize(DeviceState *qdev)
