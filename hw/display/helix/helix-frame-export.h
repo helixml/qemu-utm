@@ -122,6 +122,11 @@ typedef struct HelixErrorResponse {
 #define HELIX_MAX_SCANOUTS 16
 #define HELIX_BLIT_RING_SIZE 3  /* Triple-buffer for async VT encode */
 
+/* Keepalive interval: re-encode the last raw frame when the screen is static.
+ * 500ms = 2 FPS minimum on idle screens. This produces properly encoded H.264
+ * (not re-sent P-frames which corrupt the decoder). */
+#define HELIX_KEEPALIVE_INTERVAL_MS 500
+
 /*
  * Per-client connection state
  */
@@ -163,6 +168,15 @@ typedef struct HelixScanoutEncoder {
     volatile bool vt_busy;       /* VT has a frame in flight (prevents EncodeFrame from blocking main loop) */
     int32_t blit_width;
     int32_t blit_height;
+
+    /* Frame keepalive: re-encode the last IOSurface when the screen is static.
+     * When no page flips arrive for keepalive_interval_ns, the last blitted
+     * IOSurface is re-submitted to VideoToolbox. This produces a valid H.264
+     * frame with proper frame_num and reference list, unlike re-sending an
+     * already-encoded P-frame which corrupts the decoder's DPB. */
+    uint32_t last_blit_slot;         /* Ring slot of last successful blit */
+    bool has_blitted_frame;          /* True after first successful encode */
+    volatile uint64_t last_frame_ns; /* CLOCK_MONOTONIC nanoseconds of last encode */
 
 } HelixScanoutEncoder;
 
