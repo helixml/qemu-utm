@@ -204,10 +204,11 @@ static bool read_exact_bytes(int fd, void *buf, size_t n)
         }
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             /* Socket is O_NONBLOCK — wait for data with poll().
-             * 60s timeout: if client is silent for this long, the
-             * connection is dead. Frees the client slot promptly. */
+             * No timeout (-1): the client legitimately stays silent after
+             * SUBSCRIBE — it only reads frames. Dead connection detection
+             * is handled by SO_KEEPALIVE at the TCP level. */
             struct pollfd pfd = { .fd = fd, .events = POLLIN };
-            int ret = poll(&pfd, 1, 60 * 1000);
+            int ret = poll(&pfd, 1, -1);
             if (ret <= 0) {
                 return false;  /* Timeout or error */
             }
