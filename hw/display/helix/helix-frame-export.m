@@ -284,11 +284,31 @@ static void helix_send_to_subscribed_clients(HelixFrameExport *fe,
         if (c->subscribed_scanout != scanout_id) continue;
 
         pthread_mutex_lock(&c->send_lock);
-        /* Non-blocking send — if TCP buffer is full, drop the entire
-         * frame for this client rather than blocking the VT callback
-         * thread. Partial sends permanently desync the TCP stream
-         * (client reads garbage until next magic match), so we close
-         * the connection to force a clean reconnect. */
+        /* Check available send buffer space BEFORE attempting to send.
+         * A partial send permanently desyncs the TCP stream (client reads
+         * garbage until next magic match), so we must either send the
+         * entire frame or nothing. On macOS, SO_NWRITE returns pending
+         * bytes in the send buffer; subtract from SO_SNDBUF for available. */
+        int sndbuf = 0, pending = 0;
+        socklen_t optlen = sizeof(sndbuf);
+        if (getsockopt(c->fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, &optlen) == 0) {
+            optlen = sizeof(pending);
+            if (getsockopt(c->fd, SOL_SOCKET, SO_NWRITE, &pending, &optlen) == 0) {
+                int avail = sndbuf - pending;
+                if (avail < 0) avail = 0;
+                if ((size_t)avail < response_size) {
+                    static uint64_t space_drops = 0;
+                    space_drops++;
+                    if (space_drops == 1 || (space_drops % 100) == 0) {
+                        helix_log("[HELIX] Client %d: dropping frame (need %zu, "
+                                  "have %d/%d bytes free, total drops=%llu)",
+                                  i, response_size, avail, sndbuf, space_drops);
+                    }
+                    pthread_mutex_unlock(&c->send_lock);
+                    continue;
+                }
+            }
+        }
         ssize_t sent = send(c->fd, response_data, response_size,
                             MSG_DONTWAIT);
         bool should_disconnect = false;
@@ -1572,6 +1592,11 @@ static void *multi_accept_thread(void *arg)
         int nosigpipe = 1;
         setsockopt(client_fd, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, sizeof(nosigpipe));
 #endif
+        /* Enlarge send buffer to 1MB — default macOS buffer (~128KB) is too
+         * small for H.264 keyframes at 1080p, causing partial sends that
+         * corrupt the TCP stream and force a disconnect. */
+        int sndbuf = 1024 * 1024;
+        setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
         /* Set socket to O_NONBLOCK — CRITICAL for macOS.
          * MSG_DONTWAIT is unreliable on macOS: send() can block in __sendto
@@ -1655,8 +1680,8 @@ void helix_frame_export_cleanup(HelixFrameExport *fe)
 int helix_frame_export_init(void *virtio_gpu, int vsock_port)
 {
     helix_log("========================================");
-    helix_log("[HELIX] VERSION: 2026-02-14-v9-frame-keepalive");
-    helix_log("[HELIX] BUILD: Multi-client, per-scanout auto-encode, IOSurface keepalive");
+    helix_log("[HELIX] VERSION: 2026-02-16-v10-partial-send-guard");
+    helix_log("[HELIX] BUILD: Multi-client, per-scanout auto-encode, IOSurface keepalive, FIONSPACE guard");
     helix_log("========================================");
     helix_log("[HELIX] Initializing frame export on vsock port %d", vsock_port);
 
