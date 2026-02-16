@@ -1438,7 +1438,8 @@ static void virtio_gpu_fence_poll(void *opaque)
 
     virgl_renderer_poll();
     virtio_gpu_process_cmdq(g);
-    if (!QTAILQ_EMPTY(&g->cmdq) || !QTAILQ_EMPTY(&g->fenceq)) {
+    if (!QTAILQ_EMPTY(&g->cmdq) || !QTAILQ_EMPTY(&g->fenceq) ||
+        g->inflight > 0) {
         timer_mod(gl->fence_poll, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
     }
 }

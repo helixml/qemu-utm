@@ -1683,8 +1683,8 @@ void helix_frame_export_cleanup(HelixFrameExport *fe)
 int helix_frame_export_init(void *virtio_gpu, int vsock_port)
 {
     helix_log("========================================");
-    helix_log("[HELIX] VERSION: 2026-02-16-v10-partial-send-guard");
-    helix_log("[HELIX] BUILD: Multi-client, per-scanout auto-encode, IOSurface keepalive, FIONSPACE guard");
+    helix_log("[HELIX] VERSION: 2026-02-16-v11-multi-desktop-deadlock-fixes");
+    helix_log("[HELIX] BUILD: fence_poll inflight, FOREACH_SAFE cmdq, no renderer_blocked on unmap, ring 1024");
     helix_log("========================================");
     helix_log("[HELIX] Initializing frame export on vsock port %d", vsock_port);
 
