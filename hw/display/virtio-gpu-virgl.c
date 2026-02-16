@@ -459,6 +459,28 @@ static void virtio_gpu_rect_update(VirtIOGPU *g, int idx, int x, int y,
         return;
     }
 
+#ifdef __APPLE__
+    /* Helix frame export: skip dpy_gl_update entirely.
+     *
+     * dpy_gl_update triggers the SPICE GL display path which calls
+     * graphic_hw_gl_block → renderer_blocked++.  While renderer_blocked > 0,
+     * virtio_gpu_process_cmdq stops processing ALL commands — including
+     * commands from other scanouts' guests.  The GPU stays blocked until
+     * UTM's SPICE client fires gl_draw_done (which has no timeout safety
+     * net — just a warning log).
+     *
+     * With multiple desktops, this serializes ALL GPU work through the
+     * SPICE client's frame acknowledgment rate.  Under load, gl_draw_done
+     * stops arriving, renderer_blocked stays >0, and the entire VM hangs
+     * (guest processes block on virtio-ring submissions — kernel reports
+     * tasks blocked for 120+ seconds).
+     *
+     * Helix frame export reads GPU textures directly via GL blit in
+     * helix_update_scanout_displaysurface, independent of the SPICE
+     * display listener.  The SPICE display (UTM window) is only used
+     * for debugging; input still works via the separate SPICE channel. */
+    return;
+#else
     /* Only call dpy_gl_update for GL-capable consoles. Secondary consoles
      * use 2D SPICE mode (no GL) to avoid the gl_draw_done deadlock. */
     if (!console_has_gl(g->parent_obj.scanout[idx].con)) {
@@ -466,6 +488,7 @@ static void virtio_gpu_rect_update(VirtIOGPU *g, int idx, int x, int y,
     }
 
     dpy_gl_update(g->parent_obj.scanout[idx].con, x, y, width, height);
+#endif
 }
 
 static void virgl_cmd_resource_flush(VirtIOGPU *g,
