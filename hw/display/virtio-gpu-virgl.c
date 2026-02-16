@@ -139,6 +139,7 @@ struct virtio_gpu_virgl_hostmem_region {
     MemoryRegion mr;
     struct VirtIOGPU *g;
     bool finish_unmapping;
+    bool detached;  /* step 1 done: MR removed from hostmem, awaiting RCU */
 };
 
 static struct virtio_gpu_virgl_hostmem_region *
@@ -158,19 +159,15 @@ static void virtio_gpu_virgl_hostmem_region_free(void *obj)
 {
     MemoryRegion *mr = MEMORY_REGION(obj);
     struct virtio_gpu_virgl_hostmem_region *vmr;
-    VirtIOGPUBase *b;
     VirtIOGPUGL *gl;
 
     vmr = to_hostmem_region(mr);
     vmr->finish_unmapping = true;
 
-    b = VIRTIO_GPU_BASE(vmr->g);
-    b->renderer_blocked--;
-
     /*
      * memory_region_unref() is executed from RCU thread context, while
      * virglrenderer works only on the main-loop thread that's holding GL
-     * context.
+     * context.  Schedule BH to re-process the suspended unmap command.
      */
     gl = VIRTIO_GPU_GL(vmr->g);
     qemu_bh_schedule(gl->cmdq_resume_bh);
@@ -227,7 +224,6 @@ virtio_gpu_virgl_unmap_resource_blob(VirtIOGPU *g,
                                      bool *cmd_suspended)
 {
     struct virtio_gpu_virgl_hostmem_region *vmr;
-    VirtIOGPUBase *b = VIRTIO_GPU_BASE(g);
     MemoryRegion *mr = res->mr;
     int ret;
 
@@ -260,13 +256,25 @@ virtio_gpu_virgl_unmap_resource_blob(VirtIOGPU *g,
     } else {
         *cmd_suspended = true;
 
-        /* render will be unblocked once MR is freed */
-        b->renderer_blocked++;
-
-        /* memory region owns self res->mr object and frees it by itself */
-        memory_region_set_enabled(mr, false);
-        memory_region_del_subregion(&b->hostmem, mr);
-        object_unref(OBJECT(mr));
+        /* Don't increment renderer_blocked here.  The suspended-command
+         * mechanism (cmd_suspended + break in process_cmdq) already
+         * prevents this specific command from advancing until the RCU
+         * callback sets finish_unmapping=true.  But renderer_blocked
+         * is GLOBAL — it stops ALL command processing for ALL contexts.
+         * With multiple GPU contexts (4+ gnome-shells), blob unmaps
+         * overlap and renderer_blocked stays >0 perpetually, causing
+         * the virtio ring to fill and all guests to deadlock.
+         *
+         * Without renderer_blocked, process_cmdq may re-invoke process_cmd
+         * for this suspended command before RCU fires.  Guard against
+         * double-removal with an explicit flag (all callers are on main
+         * thread under BQL, so no atomics needed). */
+        if (!vmr->detached) {
+            vmr->detached = true;
+            memory_region_set_enabled(mr, false);
+            memory_region_del_subregion(&VIRTIO_GPU_BASE(g)->hostmem, mr);
+            object_unref(OBJECT(mr));
+        }
     }
 
     return 0;

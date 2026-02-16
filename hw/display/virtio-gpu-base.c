@@ -310,8 +310,11 @@ virtio_gpu_base_device_realize(DeviceState *qdev,
                 sizeof(struct virtio_gpu_config));
 
     if (virtio_gpu_virgl_enabled(g->conf)) {
-        /* use larger control queue in 3d mode */
-        virtio_add_queue(vdev, 256, ctrl_cb);
+        /* use larger control queue in 3d mode — 1024 is VIRTQUEUE_MAX_SIZE.
+         * With multiple GPU contexts (e.g. 4 gnome-shells), 256 entries
+         * saturates quickly causing all guests to block on ring submission
+         * (virtio_gpu_queue_ctrl_sgs) while QEMU drains commands. */
+        virtio_add_queue(vdev, 1024, ctrl_cb);
         virtio_add_queue(vdev, 16, cursor_cb);
     } else {
         virtio_add_queue(vdev, 64, ctrl_cb);
