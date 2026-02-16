@@ -1431,10 +1431,22 @@ static void virtio_gpu_print_stats(void *opaque)
     timer_mod(gl->print_stats, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
 }
 
+static uint64_t fence_poll_count;
+
 static void virtio_gpu_fence_poll(void *opaque)
 {
     VirtIOGPU *g = opaque;
     VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
+
+    fence_poll_count++;
+    if ((fence_poll_count % 500) == 1) {
+        fprintf(stderr, "fence_poll #%llu cmdq=%d fenceq=%d inflight=%d blocked=%d\n",
+                (unsigned long long)fence_poll_count,
+                !QTAILQ_EMPTY(&g->cmdq),
+                !QTAILQ_EMPTY(&g->fenceq),
+                g->inflight,
+                g->parent_obj.renderer_blocked);
+    }
 
     virgl_renderer_poll();
     virtio_gpu_process_cmdq(g);
@@ -1453,6 +1465,76 @@ static void virtio_gpu_fence_poll(void *opaque)
 void virtio_gpu_virgl_fence_poll(VirtIOGPU *g)
 {
     virtio_gpu_fence_poll(g);
+}
+
+/*
+ * Thread-based fence polling — bypasses QEMU's timer system entirely.
+ *
+ * The QEMU timer (fence_poll above) does not fire on macOS/HVF despite
+ * being correctly created with QEMU_CLOCK_REALTIME.  Other REALTIME timers
+ * (gui_update) fire normally, but fence_poll shows zero hits in process
+ * sampling.  Root cause unknown — possibly related to timer registration
+ * during handle_ctrl context (after main loop start) vs display init.
+ *
+ * Workaround: a dedicated thread sleeps 10ms, then schedules a BH on the
+ * main loop.  The BH runs on the main thread with BQL held, which is the
+ * correct context for virgl_renderer_poll() and process_cmdq().
+ *
+ * qemu_bh_schedule() is documented as thread-safe (writes to eventfd to
+ * wake the main loop).  The main loop dispatches BHs via aio_ctx_dispatch.
+ */
+static void fence_poll_bh_cb(void *opaque)
+{
+    VirtIOGPU *g = opaque;
+    VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
+    struct virtio_gpu_ctrl_command *cmd;
+
+    /*
+     * Drain the virtqueue.  When QEMU's re-entrancy guard drops a
+     * virtio-pci-notify write ("Blocked re-entrant IO on MemoryRegion"),
+     * the guest's virtqueue kick is silently lost.  The guest has already
+     * written commands to the ring, but handle_ctrl never runs to pop them.
+     * cmdq stays empty and fence_poll has nothing to process — permanent
+     * stall despite the timer running.
+     *
+     * Fix: pop any pending commands from the ring here, just like
+     * handle_ctrl does.  This runs every 10ms, so dropped kicks are
+     * recovered within one polling interval.
+     */
+    if (gl->renderer_state == RS_INITED) {
+        VirtQueue *vq = virtio_get_queue(VIRTIO_DEVICE(g), 0);
+        if (virtio_queue_ready(vq)) {
+            cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
+            while (cmd) {
+                cmd->vq = vq;
+                cmd->error = 0;
+                cmd->finished = false;
+                QTAILQ_INSERT_TAIL(&g->cmdq, cmd, next);
+                cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
+            }
+        }
+    }
+
+    virgl_renderer_poll();
+    virtio_gpu_process_cmdq(g);
+}
+
+static void *fence_poll_thread_fn(void *opaque)
+{
+    VirtIOGPU *g = opaque;
+    VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
+
+    fprintf(stderr, "[HELIX] fence_poll thread started (10ms interval)\n");
+
+    while (gl->fence_poll_thread_running) {
+        g_usleep(10000); /* 10ms = 100 Hz */
+        if (gl->fence_poll_thread_running) {
+            qemu_bh_schedule(gl->fence_poll_bh);
+        }
+    }
+
+    fprintf(stderr, "[HELIX] fence_poll thread stopped\n");
+    return NULL;
 }
 
 void virtio_gpu_virgl_reset_scanout(VirtIOGPU *g)
@@ -1513,7 +1595,19 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
 
     gl->fence_poll = timer_new_ms(QEMU_CLOCK_REALTIME,
                                   virtio_gpu_fence_poll, g);
+    fprintf(stderr, "fence_poll timer created (REALTIME), arming now\n");
     timer_mod(gl->fence_poll, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 10);
+
+    /* Thread-based fence polling as fallback — the QEMU timer above doesn't
+     * fire on macOS/HVF for unknown reasons.  The thread is harmless if the
+     * timer DOES fire (just extra virgl_renderer_poll calls). */
+    if (!gl->fence_poll_thread_running) {
+        gl->fence_poll_bh = aio_bh_new(qemu_get_aio_context(),
+                                       fence_poll_bh_cb, g);
+        gl->fence_poll_thread_running = true;
+        qemu_thread_create(&gl->fence_poll_thread, "fence-poll",
+                           fence_poll_thread_fn, g, QEMU_THREAD_JOINABLE);
+    }
 
     if (virtio_gpu_stats_enabled(g->parent_obj.conf)) {
         gl->print_stats = timer_new_ms(QEMU_CLOCK_VIRTUAL,

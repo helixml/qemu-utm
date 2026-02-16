@@ -194,6 +194,12 @@ static void virtio_gpu_gl_device_unrealize(DeviceState *qdev)
     VirtIOGPUGL *gl = VIRTIO_GPU_GL(qdev);
 
     if (gl->renderer_state >= RS_INITED) {
+        /* Stop fence_poll thread before freeing BHs/timers */
+        if (gl->fence_poll_thread_running) {
+            gl->fence_poll_thread_running = false;
+            qemu_thread_join(&gl->fence_poll_thread);
+            qemu_bh_delete(gl->fence_poll_bh);
+        }
 #if VIRGL_VERSION_MAJOR >= 1
         qemu_bh_delete(gl->cmdq_resume_bh);
 #endif

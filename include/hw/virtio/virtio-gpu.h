@@ -249,6 +249,12 @@ struct VirtIOGPUGL {
     QEMUTimer *print_stats;
 
     QEMUBH *cmdq_resume_bh;
+
+    /* Thread-based fence polling — bypasses QEMU timer system which
+     * fails to fire fence_poll on macOS/HVF for unknown reasons. */
+    QEMUBH *fence_poll_bh;
+    QemuThread fence_poll_thread;
+    bool fence_poll_thread_running;
 };
 
 struct VhostUserGPU {
