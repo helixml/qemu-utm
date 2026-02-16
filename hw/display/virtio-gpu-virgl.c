@@ -942,7 +942,18 @@ static void virgl_cmd_resource_create_blob(VirtIOGPU *g,
     virgl_args.iovecs = res->base.iov;
     virgl_args.num_iovs = res->base.iov_cnt;
 
+    /* Drop BQL around virgl blob creation — the proxy_context_get_blob path
+     * does a blocking socket recvmsg to the render server. If the server is
+     * slow (e.g. Metal heap exhaustion), holding the BQL here deadlocks the
+     * entire VM: all vCPU threads block waiting for the BQL, so guest
+     * commands that would free GPU resources can never execute.
+     *
+     * virgl_renderer_resource_create_blob only accesses virglrenderer's
+     * internal state (resource table, proxy socket), not QEMU device model
+     * state, so dropping the BQL is safe. */
+    bql_unlock();
     ret = virgl_renderer_resource_create_blob(&virgl_args);
+    bql_lock();
     if (ret) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: virgl blob create error: %s\n",
                       __func__, strerror(-ret));

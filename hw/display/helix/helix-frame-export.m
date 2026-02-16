@@ -932,12 +932,14 @@ static int create_scanout_encoder(HelixFrameExport *fe, uint32_t scanout_id,
     VTSessionSetProperty(enc->session, kVTCompressionPropertyKey_MaxKeyFrameInterval, maxKeyFrameRef);
     CFRelease(maxKeyFrameRef);
 
-    /* Use provided bitrate, or auto-scale from resolution (~4 bits/pixel) */
+    /* Use provided bitrate, or auto-scale from resolution.
+     * ~10 bits/pixel gives 20 Mbps at 1080p — enough headroom for
+     * sharp text and saturated colours (reds) in 4:2:0 chroma. */
     int effective_bitrate = bitrate;
     if (effective_bitrate <= 0) {
         int64_t pixels = (int64_t)width * (int64_t)height;
-        effective_bitrate = (int32_t)(pixels * 4);
-        if (effective_bitrate < 5000000) effective_bitrate = 5000000;  /* 5 Mbps minimum */
+        effective_bitrate = (int32_t)(pixels * 10);
+        if (effective_bitrate < 20000000) effective_bitrate = 20000000;  /* 20 Mbps minimum */
     }
     CFNumberRef bitrateRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &effective_bitrate);
     VTSessionSetProperty(enc->session, kVTCompressionPropertyKey_AverageBitRate, bitrateRef);
