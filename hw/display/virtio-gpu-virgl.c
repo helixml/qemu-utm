@@ -1438,10 +1438,16 @@ static void virtio_gpu_fence_poll(void *opaque)
 
     virgl_renderer_poll();
     virtio_gpu_process_cmdq(g);
-    if (!QTAILQ_EMPTY(&g->cmdq) || !QTAILQ_EMPTY(&g->fenceq) ||
-        g->inflight > 0) {
-        timer_mod(gl->fence_poll, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
-    }
+    /* Always re-arm.  The conditional re-arm (only when cmdq/fenceq/inflight
+     * non-empty) causes permanent stalls: if the timer stops while a guest
+     * thread is blocked in virtio_gpu_vram_mmap (synchronous wait for QEMU
+     * to process the command), no new virtqueue kick arrives to restart the
+     * timer via handle_ctrl.  100 Hz polling is negligible overhead.
+     *
+     * Use QEMU_CLOCK_REALTIME (not VIRTUAL) — VIRTUAL stops advancing when
+     * all vCPUs are halted (WFI), which happens when every guest thread is
+     * blocked on GPU fences.  REALTIME always ticks. */
+    timer_mod(gl->fence_poll, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 10);
 }
 
 void virtio_gpu_virgl_fence_poll(VirtIOGPU *g)
@@ -1505,8 +1511,9 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
     /* Initialize Helix frame export for zero-copy GPU frame sharing */
     helix_frame_export_init(g, g->helix_port); /* TCP port from helix-port property */
 
-    gl->fence_poll = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+    gl->fence_poll = timer_new_ms(QEMU_CLOCK_REALTIME,
                                   virtio_gpu_fence_poll, g);
+    timer_mod(gl->fence_poll, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 10);
 
     if (virtio_gpu_stats_enabled(g->parent_obj.conf)) {
         gl->print_stats = timer_new_ms(QEMU_CLOCK_VIRTUAL,
