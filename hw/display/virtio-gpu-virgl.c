@@ -413,9 +413,31 @@ static void virgl_cmd_resource_unref(VirtIOGPU *g,
     if (res_iovs != NULL && num_iovs != 0) {
         virtio_gpu_cleanup_mapping_iov(g, res_iovs, num_iovs);
     }
-    virgl_renderer_resource_unref(unref.resource_id);
 
+    /* Remove from QEMU's resource list while we still hold BQL — after this,
+     * no other code path can find or use this resource. */
     QTAILQ_REMOVE(&g->reslist, &res->base, next);
+
+    /* Drop BQL around virglrenderer resource destruction.
+     *
+     * virgl_resource_destroy_func calls CFRelease on Metal textures/IOSurfaces.
+     * This can block indefinitely — Metal's deallocation may wait for GPU
+     * operations to complete, or IOSurface cross-process cleanup can deadlock
+     * on internal locks. Holding BQL during this blocks all vCPU threads,
+     * freezing the entire VM.
+     *
+     * This is the same pattern as virgl_renderer_resource_create_blob (line ~985)
+     * which already drops BQL because the proxy path can block on Metal.
+     *
+     * virgl_renderer_resource_unref only accesses virglrenderer's internal hash
+     * table and calls the resource destroy callback — it does not access QEMU
+     * device model state. The QEMU-side cleanup (IOV detach, mapping cleanup,
+     * reslist removal) is already done above while BQL was held.
+     *
+     * See: design/2026-02-28-multi-desktop-cfrelease-deadlock.md */
+    bql_unlock();
+    virgl_renderer_resource_unref(unref.resource_id);
+    bql_lock();
 
     g_free(res);
 }
@@ -1000,7 +1022,11 @@ static void virgl_cmd_resource_create_blob(VirtIOGPU *g,
                       __func__, cblob.resource_id, strerror(-ret));
         cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
         virtio_gpu_cleanup_mapping(g, &res->base);
+        /* Drop BQL — same CFRelease deadlock risk as virgl_cmd_resource_unref.
+         * Resource was never added to reslist, so no QTAILQ_REMOVE needed. */
+        bql_unlock();
         virgl_renderer_resource_unref(cblob.resource_id);
+        bql_lock();
         return;
     }
 
