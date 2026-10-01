@@ -5,7 +5,6 @@
 /dtc
 /keycodemapdb
 /libvfio-user
-/slirp
 /arbitrary-int-1.2.7
 /bilge-0.2.0
 /bilge-impl-0.2.0
