@@ -1280,8 +1280,13 @@ endif
 
 slirp = not_found
 if not get_option('slirp').auto() or have_system
+  # Helix: always use the vendored, patched libslirp in subprojects/slirp
+  # (linked statically), never a system or UTM sysroot copy.
+  if get_option('slirp').allowed()
+    subproject('slirp', default_options: ['default_library=static'])
+  endif
   slirp = dependency('slirp', required: get_option('slirp'),
-                     method: 'pkg-config')
+                     allow_fallback: false)
   # slirp < 4.7 is incompatible with CFI support in QEMU.  This is because
   # it passes function pointers within libslirp as callbacks for timers.
   # When using a system-wide shared libslirp, the type information for the

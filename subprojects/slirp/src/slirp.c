@@ -276,6 +276,51 @@ static int get_dns_addr_cached(void *pdns_addr, void *cached_addr,
     return 1;
 }
 
+/*
+ * res_getservers() reports sin6_scope_id == 0 for link-local nameservers
+ * (e.g. fe80::1%en0, common on IPv6-only networks such as phone hotspots),
+ * which makes them unreachable. macOS writes the scope into /etc/resolv.conf
+ * ("nameserver fe80::1%en0"), so recover it from there. Returns 0 if unknown.
+ */
+static uint32_t resolv_conf_scope_id(const char *path,
+                                     const struct in6_addr *addr)
+{
+    char buff[512];
+    char buff2[257];
+    uint32_t scope_id = 0;
+    FILE *f;
+
+    f = fopen(path, "r");
+    if (!f) {
+        return 0;
+    }
+
+    while (fgets(buff, sizeof(buff), f) != NULL) {
+        struct in6_addr tmp_addr;
+        char *c;
+
+        if (sscanf(buff, "nameserver%*[ \t]%256s", buff2) != 1) {
+            continue;
+        }
+        c = strchr(buff2, '%');
+        if (!c) {
+            continue;
+        }
+        *c++ = '\0';
+        if (inet_pton(AF_INET6, buff2, &tmp_addr) != 1 ||
+            !in6_equal(&tmp_addr, addr)) {
+            continue;
+        }
+        scope_id = if_nametoindex(c);
+        if (scope_id == 0) {
+            scope_id = strtoul(c, NULL, 10);
+        }
+        break;
+    }
+    fclose(f);
+    return scope_id;
+}
+
 static int get_dns_addr_libresolv(int af, void *pdns_addr, void *cached_addr,
                                   socklen_t addrlen,
                                   uint16_t *pdns_port, uint16_t *cached_port,
@@ -288,6 +333,7 @@ static int get_dns_addr_libresolv(int af, void *pdns_addr, void *cached_addr,
     int found;
     void *addr;
     uint16_t port;
+    uint32_t if_index = 0;
 
     // we only support IPv4 and IPv4, we assume it's one or the other
     assert(af == AF_INET || af == AF_INET6);
@@ -304,15 +350,30 @@ static int get_dns_addr_libresolv(int af, void *pdns_addr, void *cached_addr,
             continue;
         }
 
-        found++;
-
         if (af == AF_INET) {
             addr = &servers[i].sin.sin_addr;
             port = servers[i].sin.sin_port;
         } else { // af == AF_INET6
-            addr = &servers[i].sin6.sin6_addr;
+            struct in6_addr *addr6 = &servers[i].sin6.sin6_addr;
+
+            addr = addr6;
             port = servers[i].sin6.sin6_port;
+            if_index = servers[i].sin6.sin6_scope_id;
+            if (IN6_IS_ADDR_LINKLOCAL(addr6)) {
+                // Drop any KAME-style embedded scope; fe80::/64 has zeros here
+                addr6->s6_addr[2] = 0;
+                addr6->s6_addr[3] = 0;
+                if (if_index == 0) {
+                    if_index = resolv_conf_scope_id("/etc/resolv.conf", addr6);
+                }
+                if (if_index == 0) {
+                    // Unreachable without a scope: try the next server
+                    continue;
+                }
+            }
         }
+
+        found++;
 
         // we use the first found entry
         if (found == 1) {
@@ -320,10 +381,10 @@ static int get_dns_addr_libresolv(int af, void *pdns_addr, void *cached_addr,
             memcpy(cached_addr, addr, addrlen);
             *pdns_port = *cached_port = port;
             if (scope_id) {
-                *scope_id = 0;
+                *scope_id = if_index;
             }
             if (cached_scope_id) {
-                *cached_scope_id = 0;
+                *cached_scope_id = if_index;
             }
             *cached_time = curtime;
         }
