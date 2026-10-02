@@ -1987,8 +1987,8 @@ static void hvf_wfi(CPUState *cpu)
     uint64_t nanos;
     uint32_t cntfrq;
 
-    if (cpu->interrupt_request & (CPU_INTERRUPT_HARD | CPU_INTERRUPT_FIQ)) {
-        /* Interrupt pending, no need to wait */
+    if (cpu_has_work(cpu)) {
+        /* Pending work, no need to wait */
         return;
     }
 
@@ -2013,15 +2013,6 @@ static void hvf_wfi(CPUState *cpu)
     seconds = muldiv64(ticks_to_sleep, cntfrq, NANOSECONDS_PER_SECOND);
     ticks_to_sleep -= muldiv64(seconds, NANOSECONDS_PER_SECOND, cntfrq);
     nanos = ticks_to_sleep * cntfrq;
-
-    /*
-     * Don't sleep for less than the time a context switch would take,
-     * so that we can satisfy fast timer requests on the same CPU.
-     * Measurements on M1 show the sweet spot to be ~2ms.
-     */
-    if (!seconds && nanos < (2 * SCALE_MS)) {
-        return;
-    }
 
     ts = (struct timespec) { seconds, nanos };
     hvf_wait_for_ipi(cpu, &ts);
