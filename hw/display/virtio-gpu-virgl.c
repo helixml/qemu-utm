@@ -21,6 +21,7 @@
 #include "hw/virtio/virtio-gpu-pixman.h"
 
 #include "ui/egl-helpers.h"
+#include "hw/display/helix/helix-frame-export.h"
 
 #define VIRGL_RENDERER_UNSTABLE_APIS
 #include <virglrenderer.h>
@@ -525,9 +526,16 @@ static void virgl_cmd_resource_unref(VirtIOGPU *g,
     if (res_iovs != NULL && num_iovs != 0) {
         virtio_gpu_cleanup_mapping_iov(g, res_iovs, num_iovs);
     }
-    virgl_renderer_resource_unref(unref.resource_id);
 
     QTAILQ_REMOVE(&g->reslist, &res->base, next);
+
+    /* Drop BQL around virglrenderer resource destruction.
+     * CFRelease on Metal textures/IOSurfaces can block indefinitely,
+     * and holding BQL during this blocks all vCPU threads, freezing
+     * the entire VM. QEMU-side cleanup is already done above. */
+    bql_unlock();
+    virgl_renderer_resource_unref(unref.resource_id);
+    bql_lock();
 
     g_free(res);
 }
@@ -579,7 +587,16 @@ static void virtio_gpu_rect_update(VirtIOGPU *g, int idx, int x, int y,
         return;
     }
 
+#ifdef __APPLE__
+    /* Helix frame export reads GPU textures directly via GL blit,
+     * independent of the SPICE display listener.  Calling dpy_gl_update
+     * triggers renderer_blocked++ via graphic_hw_gl_block, which with
+     * multiple desktops serializes all GPU work through the SPICE client's
+     * frame acknowledgment rate, causing VM hangs. */
+    return;
+#else
     dpy_gl_update(g->parent_obj.scanout[idx].con, x, y, width, height);
+#endif
 }
 
 static void virgl_cmd_resource_flush(VirtIOGPU *g,
@@ -954,7 +971,13 @@ static void virgl_cmd_resource_create_blob(VirtIOGPU *g,
     virgl_args.iovecs = res->base.iov;
     virgl_args.num_iovs = res->base.iov_cnt;
 
+    /* Drop BQL around virgl blob creation — the proxy_context_get_blob path
+     * does a blocking socket recvmsg to the render server. If the server is
+     * slow (e.g. Metal heap exhaustion), holding the BQL here deadlocks the
+     * entire VM. */
+    bql_unlock();
     ret = virgl_renderer_resource_create_blob(&virgl_args);
+    bql_lock();
     if (ret) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: virgl blob create error: %s\n",
                       __func__, strerror(-ret));
@@ -970,7 +993,10 @@ static void virgl_cmd_resource_create_blob(VirtIOGPU *g,
                       __func__, cblob.resource_id, strerror(-ret));
         cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
         virtio_gpu_cleanup_mapping(g, &res->base);
+        /* Drop BQL — same CFRelease deadlock risk as virgl_cmd_resource_unref. */
+        bql_unlock();
         virgl_renderer_resource_unref(cblob.resource_id);
+        bql_lock();
         return;
     }
 
@@ -1552,53 +1578,130 @@ static void virtio_gpu_print_stats(void *opaque)
     timer_mod(gl->print_stats, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
 }
 
+static uint64_t fence_poll_count;
+
 static void virtio_gpu_fence_poll(void *opaque)
 {
     VirtIOGPU *g = opaque;
     VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
 
+    fence_poll_count++;
+    if ((fence_poll_count % 500) == 1) {
+        fprintf(stderr, "fence_poll #%llu cmdq=%d fenceq=%d inflight=%d blocked=%d\n",
+                (unsigned long long)fence_poll_count,
+                !QTAILQ_EMPTY(&g->cmdq),
+                !QTAILQ_EMPTY(&g->fenceq),
+                g->inflight,
+                g->parent_obj.renderer_blocked);
+    }
+
     virgl_renderer_poll();
     virtio_gpu_process_cmdq(g);
-    if (!QTAILQ_EMPTY(&g->cmdq) || !QTAILQ_EMPTY(&g->fenceq)) {
-        /*
-         * Without async fencing, virgl_renderer_poll() is the only place a
-         * retired renderer fence is discovered, so this period is a hard
-         * floor under every guest operation that blocks on a fence -- keep
-         * it at the millisecond-timer granularity.
-         *
-         * With async fencing, ring (venus/neptune context) fences retire
-         * through the proxy sync thread and async_fence_bh; the poll's job
-         * shrinks to discovering vrend/global fences, which still retire
-         * only from virgl_renderer_poll() (vrend's async path is EGL-only
-         * and disabled here).  While only ring fences are pending, relax to
-         * a slow tick -- it still runs process_cmdq and catches any global
-         * fence that appears; virgl_renderer_poll() skips proxy contexts
-         * under ASYNC_FENCE_CB, so it cannot rescue a missed ring-fence
-         * wake (the sync thread's poll on the worker socket covers worker
-         * death instead).  Any pending global fence keeps the 1 ms rate.
-         */
-        uint64_t period_ms = 1;
-        if (gl->async_fence_enabled) {
-            struct virtio_gpu_ctrl_command *cmd;
-            bool poll_needed = !QTAILQ_EMPTY(&g->cmdq);
-            QTAILQ_FOREACH(cmd, &g->fenceq, next) {
-                if (!(cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX)) {
-                    poll_needed = true;
-                    break;
-                }
-            }
-            if (!poll_needed) {
-                period_ms = 100;
-            }
-        }
-        timer_mod(gl->fence_poll,
-                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + period_ms);
-    }
+    /* Always re-arm.  The conditional re-arm causes permanent stalls when
+     * a guest thread is blocked in virtio_gpu_vram_mmap (synchronous wait
+     * for QEMU to process the command) and no new virtqueue kick arrives.
+     * Use QEMU_CLOCK_REALTIME — VIRTUAL stops advancing when all vCPUs are
+     * halted (WFI), which happens when every guest thread is blocked on
+     * GPU fences. */
+    timer_mod(gl->fence_poll, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 10);
 }
 
 void virtio_gpu_virgl_fence_poll(VirtIOGPU *g)
 {
     virtio_gpu_fence_poll(g);
+}
+
+/*
+ * Thread-based fence polling — bypasses QEMU's timer system entirely.
+ *
+ * The QEMU timer (fence_poll above) does not fire on macOS/HVF despite
+ * being correctly created with QEMU_CLOCK_REALTIME.  Workaround: a
+ * dedicated thread sleeps 10ms, then schedules a BH on the main loop.
+ */
+static void fence_poll_bh_cb(void *opaque)
+{
+    VirtIOGPU *g = opaque;
+    VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
+    struct virtio_gpu_ctrl_command *cmd;
+
+    /* Drain the virtqueue — recover from dropped re-entrancy-guard kicks */
+    if (gl->renderer_state == RS_INITED) {
+        VirtQueue *vq = virtio_get_queue(VIRTIO_DEVICE(g), 0);
+        if (virtio_queue_ready(vq)) {
+            cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
+            while (cmd) {
+                cmd->vq = vq;
+                cmd->error = 0;
+                cmd->finished = false;
+                QTAILQ_INSERT_TAIL(&g->cmdq, cmd, next);
+                cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
+            }
+        }
+    }
+
+    virgl_renderer_poll();
+    virtio_gpu_process_cmdq(g);
+}
+
+static void *fence_poll_thread_fn(void *opaque)
+{
+    VirtIOGPU *g = opaque;
+    VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
+
+    fprintf(stderr, "[HELIX] fence_poll thread started (10ms interval)\n");
+
+    while (gl->fence_poll_thread_running) {
+        g_usleep(10000); /* 10ms = 100 Hz */
+        if (gl->fence_poll_thread_running) {
+            qemu_bh_schedule(gl->fence_poll_bh);
+        }
+    }
+
+    fprintf(stderr, "[HELIX] fence_poll thread stopped\n");
+    return NULL;
+}
+
+uint32_t virtio_gpu_get_scanout_resource_id(void *virtio_gpu, uint32_t scanout_idx)
+{
+    VirtIOGPU *g = (VirtIOGPU *)virtio_gpu;
+
+    if (scanout_idx >= VIRTIO_GPU_MAX_SCANOUTS) {
+        return 0;
+    }
+
+    return g->parent_obj.scanout[scanout_idx].resource_id;
+}
+
+bool virtio_gpu_get_scanout_surface_data(void *virtio_gpu,
+                                          uint32_t scanout_idx,
+                                          uint32_t *width,
+                                          uint32_t *height,
+                                          uint32_t *stride,
+                                          void **data)
+{
+    VirtIOGPU *g = (VirtIOGPU *)virtio_gpu;
+
+    if (scanout_idx >= VIRTIO_GPU_MAX_SCANOUTS) {
+        return false;
+    }
+
+    struct virtio_gpu_scanout *scanout = &g->parent_obj.scanout[scanout_idx];
+    DisplaySurface *ds = scanout->ds;
+
+    if (!ds) {
+        return false;
+    }
+
+    *width = surface_width(ds);
+    *height = surface_height(ds);
+    *stride = surface_stride(ds);
+    *data = surface_data(ds);
+
+    if (!*data || *width == 0 || *height == 0) {
+        return false;
+    }
+
+    return true;
 }
 
 void virtio_gpu_virgl_reset_scanout(VirtIOGPU *g)
@@ -1683,8 +1786,22 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
         return ret;
     }
 
-    gl->fence_poll = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+    /* Initialize Helix frame export for zero-copy GPU frame sharing */
+    helix_frame_export_init(g, g->helix_port);
+
+    gl->fence_poll = timer_new_ms(QEMU_CLOCK_REALTIME,
                                   virtio_gpu_fence_poll, g);
+    timer_mod(gl->fence_poll, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 10);
+
+    /* Thread-based fence polling as fallback — the QEMU timer above doesn't
+     * fire on macOS/HVF for unknown reasons. */
+    if (!gl->fence_poll_thread_running) {
+        gl->fence_poll_bh = aio_bh_new(qemu_get_aio_context(),
+                                       fence_poll_bh_cb, g);
+        gl->fence_poll_thread_running = true;
+        qemu_thread_create(&gl->fence_poll_thread, "fence-poll",
+                           fence_poll_thread_fn, g, QEMU_THREAD_JOINABLE);
+    }
 
     if (virtio_gpu_stats_enabled(g->parent_obj.conf)) {
         gl->print_stats = timer_new_ms(QEMU_CLOCK_VIRTUAL,

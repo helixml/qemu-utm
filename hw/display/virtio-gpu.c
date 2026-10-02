@@ -1044,15 +1044,14 @@ static void virtio_gpu_handle_cursor_cb(VirtIODevice *vdev, VirtQueue *vq)
 
 void virtio_gpu_process_cmdq(VirtIOGPU *g)
 {
-    struct virtio_gpu_ctrl_command *cmd;
+    struct virtio_gpu_ctrl_command *cmd, *tmp;
     VirtIOGPUClass *vgc = VIRTIO_GPU_GET_CLASS(g);
 
     if (g->processing_cmdq) {
         return;
     }
     g->processing_cmdq = true;
-    while (!QTAILQ_EMPTY(&g->cmdq)) {
-        cmd = QTAILQ_FIRST(&g->cmdq);
+    QTAILQ_FOREACH_SAFE(cmd, &g->cmdq, next, tmp) {
 
         if (g->parent_obj.renderer_blocked) {
             break;
@@ -1071,15 +1070,15 @@ void virtio_gpu_process_cmdq(VirtIOGPU *g)
             continue;
         }
 
-        /*
-         * A suspended command has not registered its fence (if any) yet
-         * and must be re-processed at the cmdq head after resume, so it
-         * must not be moved to fenceq like a normal in-flight fence.
-         */
+        /* command suspended (e.g. async blob unmap waiting for RCU) —
+         * leave it in the queue and continue processing later commands.
+         * This prevents a single suspended blob unmap from blocking ALL
+         * command processing across all GPU contexts, which caused
+         * virtio ring starvation and guest deadlock with 4+ desktops. */
         if (cmd->suspended ||
             (!cmd->finished && !(cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_FENCE))) {
             trace_virtio_gpu_cmd_suspended(cmd->cmd_hdr.type);
-            break;
+            continue;
         }
 
         QTAILQ_REMOVE(&g->cmdq, cmd, next);

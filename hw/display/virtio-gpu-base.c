@@ -194,8 +194,11 @@ virtio_gpu_base_device_realize(DeviceState *qdev,
                 sizeof(struct virtio_gpu_config));
 
     if (virtio_gpu_virgl_enabled(g->conf)) {
-        /* use larger control queue in 3d mode */
-        virtio_add_queue(vdev, 256, ctrl_cb);
+        /* use larger control queue in 3d mode — 1024 is VIRTQUEUE_MAX_SIZE.
+         * With multiple GPU contexts (e.g. 4 gnome-shells), 256 entries
+         * saturates quickly causing all guests to block on ring submission
+         * (virtio_gpu_queue_ctrl_sgs) while QEMU drains commands. */
+        virtio_add_queue(vdev, 1024, ctrl_cb);
         virtio_add_queue(vdev, 16, cursor_cb);
     } else {
         virtio_add_queue(vdev, 64, ctrl_cb);
@@ -294,6 +297,48 @@ virtio_register_types(void)
 }
 
 type_init(virtio_register_types)
+
+int helix_enable_scanout(void *virtio_gpu, uint32_t scanout_id,
+                         uint32_t width, uint32_t height)
+{
+    VirtIOGPUBase *g = VIRTIO_GPU_BASE(virtio_gpu);
+    if (scanout_id >= g->conf.max_outputs || scanout_id == 0) {
+        error_report("[HELIX] Invalid scanout_id %u (max=%d)\n",
+                     scanout_id, g->conf.max_outputs);
+        return -1;
+    }
+
+    g->req_state[scanout_id].width = width;
+    g->req_state[scanout_id].height = height;
+    g->enabled_output_bitmask |= (1 << scanout_id);
+
+    if (!g->scanout[scanout_id].con) {
+        g->scanout[scanout_id].con =
+            graphic_console_init(DEVICE(g), scanout_id, g->hw_ops, g);
+    }
+
+    virtio_gpu_notify_event(g, VIRTIO_GPU_EVENT_DISPLAY);
+
+    error_report("[HELIX] Scanout %u enabled: %ux%u\n",
+                 scanout_id, width, height);
+    return 0;
+}
+
+int helix_disable_scanout(void *virtio_gpu, uint32_t scanout_id)
+{
+    VirtIOGPUBase *g = VIRTIO_GPU_BASE(virtio_gpu);
+    if (scanout_id >= g->conf.max_outputs || scanout_id == 0) {
+        return -1;
+    }
+
+    g->req_state[scanout_id].width = 0;
+    g->req_state[scanout_id].height = 0;
+    g->enabled_output_bitmask &= ~(1 << scanout_id);
+    virtio_gpu_notify_event(g, VIRTIO_GPU_EVENT_DISPLAY);
+
+    error_report("[HELIX] Scanout %u disabled\n", scanout_id);
+    return 0;
+}
 
 QEMU_BUILD_BUG_ON(sizeof(struct virtio_gpu_ctrl_hdr)                != 24);
 QEMU_BUILD_BUG_ON(sizeof(struct virtio_gpu_update_cursor)           != 56);

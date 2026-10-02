@@ -236,6 +236,8 @@ struct VirtIOGPU {
     } dmabuf;
 
     GArray *capset_ids;
+
+    uint32_t helix_port; /* TCP port for Helix frame export (0 = default 15937) */
 };
 
 struct VirtIOGPUClass {
@@ -285,6 +287,12 @@ struct VirtIOGPUGL {
     QSLIST_HEAD(, virtio_gpu_virgl_context_fence) async_fenceq;
     /* fences retire via async_fence_bh; fence_poll is only a watchdog */
     bool async_fence_enabled;
+
+    /* Thread-based fence polling — bypasses QEMU timer system which
+     * fails to fire fence_poll on macOS/HVF for unknown reasons. */
+    QEMUBH *fence_poll_bh;
+    QemuThread fence_poll_thread;
+    bool fence_poll_thread_running;
 };
 
 struct VhostUserGPU {
