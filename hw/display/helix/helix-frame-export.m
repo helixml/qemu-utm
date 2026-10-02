@@ -1683,8 +1683,8 @@ void helix_frame_export_cleanup(HelixFrameExport *fe)
 int helix_frame_export_init(void *virtio_gpu, int vsock_port)
 {
     helix_log("========================================");
-    helix_log("[HELIX] VERSION: 2026-10-01-v12-vendored-slirp-ipv6-dns-scope");
-    helix_log("[HELIX] BUILD: vendored libslirp 4.9.5 + link-local IPv6 DNS scope fix, fence_poll inflight, FOREACH_SAFE cmdq, ring 1024");
+    helix_log("[HELIX] VERSION: 2026-10-02-v13-hvf-wfi-idle-sleep");
+    helix_log("[HELIX] BUILD: HVF WFI sleeps to vtimer deadline (no 2ms spin), vendored libslirp 4.9.5 + link-local IPv6 DNS scope fix, fence_poll inflight, FOREACH_SAFE cmdq, ring 1024");
     helix_log("========================================");
     helix_log("[HELIX] Initializing frame export on vsock port %d", vsock_port);
 
