@@ -650,6 +650,23 @@ uint64_t kvm_arch_get_supported_msr_feature(KVMState *s, uint32_t index)
         must_be_one = (uint32_t)value;
         can_be_one = (uint32_t)(value >> 32);
         return can_be_one & ~must_be_one;
+    case MSR_IA32_ARCH_CAPABILITIES:
+        /*
+         * Special handling for fb-clear bit in ARCH_CAPABILITIES MSR.
+         * KVM will only report the bit if it is enabled in the host,
+         * but, for live migration capability purposes, we want to
+         * expose the bit to the guest even if it is disabled in the
+         * host, as long as the host itself is not vulnerable to
+         * the issue that the fb-clear bit is meant to mitigate.
+         */
+        if ((value & MSR_ARCH_CAP_MDS_NO) &&
+            (value & MSR_ARCH_CAP_TAA_NO) &&
+            (value & MSR_ARCH_CAP_SBDR_SSDP_NO) &&
+            (value & MSR_ARCH_CAP_FBSDP_NO) &&
+            (value & MSR_ARCH_CAP_PSDP_NO)) {
+                value |= MSR_ARCH_CAP_FB_CLEAR;
+        }
+        return value;
 
     default:
         return value;
@@ -2674,6 +2691,7 @@ static MemoryRegion smram_as_mem;
 
 static void register_smram_listener(Notifier *n, void *unused)
 {
+    CPUState *cpu;
     MemoryRegion *smram =
         (MemoryRegion *) object_resolve_path("/machine/smram", NULL);
 
@@ -2697,7 +2715,17 @@ static void register_smram_listener(Notifier *n, void *unused)
 
     address_space_init(&smram_address_space, &smram_as_root, "KVM-SMRAM");
     kvm_memory_listener_register(kvm_state, &smram_listener,
-                                 &smram_address_space, 1, "kvm-smram");
+                                 &smram_address_space, X86ASIdx_SMM, "kvm-smram");
+
+    CPU_FOREACH(cpu) {
+        cpu_address_space_init(cpu, X86ASIdx_SMM, "cpu-smm", &smram_as_root);
+    }
+}
+
+/* It should only be called in cpu's hotplug callback */
+void kvm_smm_cpu_address_space_init(X86CPU *cpu)
+{
+    cpu_address_space_init(CPU(cpu), X86ASIdx_SMM, "cpu-smm", &smram_as_root);
 }
 
 static void *kvm_msr_energy_thread(void *data)
@@ -3342,6 +3370,28 @@ int kvm_arch_init(MachineState *ms, KVMState *s)
             if (ret < 0) {
                 error_report("kvm : error RAPL feature requirement not met");
                 return ret;
+            }
+        }
+    }
+
+    /*
+     * Most x86 CPUs in current use have self-snoop, so honoring guest PAT is
+     * preferable.  As well, the bochs video driver bug which motivated making
+     * this a default-enabled quirk in KVM was fixed long ago.
+     */
+    if (s->honor_guest_pat != ON_OFF_AUTO_OFF) {
+        ret = kvm_check_extension(s, KVM_CAP_DISABLE_QUIRKS2);
+        if (ret & KVM_X86_QUIRK_IGNORE_GUEST_PAT) {
+            ret = kvm_vm_enable_cap(s, KVM_CAP_DISABLE_QUIRKS2, 0,
+                                    KVM_X86_QUIRK_IGNORE_GUEST_PAT);
+            if (ret < 0) {
+                error_report("failed to disable KVM_X86_QUIRK_IGNORE_GUEST_PAT");
+                return ret;
+            }
+        } else {
+            if (s->honor_guest_pat == ON_OFF_AUTO_ON) {
+                error_report("KVM does not support disabling ignore-guest-PAT quirk");
+                return -EINVAL;
             }
         }
     }
@@ -5615,6 +5665,7 @@ int kvm_arch_process_async_events(CPUState *cs)
         cs->halted = 0;
     }
     if (cs->interrupt_request & CPU_INTERRUPT_SIPI) {
+        cpu_reset_interrupt(cs, CPU_INTERRUPT_SIPI);
         kvm_cpu_synchronize_state(cs);
         do_cpu_sipi(cpu);
     }
@@ -6537,6 +6588,24 @@ static void kvm_arch_set_xen_evtchn_max_pirq(Object *obj, Visitor *v,
     s->xen_evtchn_max_pirq = value;
 }
 
+static int kvm_arch_get_honor_guest_pat(Object *obj, Error **errp)
+{
+    KVMState *s = KVM_STATE(obj);
+    return s->honor_guest_pat;
+}
+
+static void kvm_arch_set_honor_guest_pat(Object *obj, int value, Error **errp)
+{
+    KVMState *s = KVM_STATE(obj);
+
+    if (s->fd != -1) {
+        error_setg(errp, "Cannot set properties after the accelerator has been initialized");
+        return;
+    }
+
+    s->honor_guest_pat = value;
+}
+
 void kvm_arch_accel_class_init(ObjectClass *oc)
 {
     object_class_property_add_enum(oc, "notify-vmexit", "NotifyVMexitOption",
@@ -6576,6 +6645,14 @@ void kvm_arch_accel_class_init(ObjectClass *oc)
                               NULL, NULL);
     object_class_property_set_description(oc, "xen-evtchn-max-pirq",
                                           "Maximum number of Xen PIRQs");
+
+    object_class_property_add_enum(oc, "honor-guest-pat", "OnOffAuto",
+                                   &OnOffAuto_lookup,
+                                   kvm_arch_get_honor_guest_pat,
+                                   kvm_arch_set_honor_guest_pat);
+    object_class_property_set_description(oc, "honor-guest-pat",
+                                          "Disable KVM quirk that ignores guest PAT "
+                                          "memory type settings (default: auto)");
 }
 
 void kvm_set_max_apic_id(uint32_t max_apic_id)

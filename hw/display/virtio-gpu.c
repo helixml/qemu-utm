@@ -227,16 +227,20 @@ void virtio_gpu_get_edid(VirtIOGPU *g,
     virtio_gpu_ctrl_response(g, cmd, &edid.hdr, sizeof(edid));
 }
 
-static uint32_t calc_image_hostmem(pixman_format_code_t pformat,
-                                   uint32_t width, uint32_t height)
+static bool calc_image_hostmem(pixman_format_code_t pformat,
+                               uint32_t width, uint32_t height,
+                               uint32_t *hostmem)
 {
-    /* Copied from pixman/pixman-bits-image.c, skip integer overflow check.
-     * pixman_image_create_bits will fail in case it overflow.
-     */
+    uint64_t bpp = PIXMAN_FORMAT_BPP(pformat);
+    uint64_t stride = (((uint64_t)width * bpp + 0x1f) >> 5) * sizeof(uint32_t);
+    uint64_t size = (uint64_t)height * stride;
 
-    int bpp = PIXMAN_FORMAT_BPP(pformat);
-    int stride = ((width * bpp + 0x1f) >> 5) * sizeof(uint32_t);
-    return height * stride;
+    if (size > UINT32_MAX) {
+        return false;
+    }
+
+    *hostmem = size;
+    return true;
 }
 
 static void virtio_gpu_resource_create_2d(VirtIOGPU *g,
@@ -245,6 +249,7 @@ static void virtio_gpu_resource_create_2d(VirtIOGPU *g,
     pixman_format_code_t pformat;
     struct virtio_gpu_simple_resource *res;
     struct virtio_gpu_resource_create_2d c2d;
+    uint32_t hostmem;
 
     VIRTIO_GPU_FILL_CMD(c2d);
     virtio_gpu_bswap_32(&c2d, sizeof(c2d));
@@ -283,7 +288,12 @@ static void virtio_gpu_resource_create_2d(VirtIOGPU *g,
         return;
     }
 
-    res->hostmem = calc_image_hostmem(pformat, c2d.width, c2d.height);
+    if (!calc_image_hostmem(pformat, c2d.width, c2d.height, &hostmem)) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: image dimensions overflow\n",
+                      __func__);
+        goto end;
+    }
+    res->hostmem = hostmem;
     if (res->hostmem + g->hostmem < g->conf_max_hostmem) {
         if (!qemu_pixman_image_new_shareable(
                 &res->image,
@@ -385,9 +395,9 @@ void virtio_gpu_disable_scanout(VirtIOGPU *g, int scanout_id)
     scanout->height = 0;
 }
 
-static void virtio_gpu_resource_destroy(VirtIOGPU *g,
-                                        struct virtio_gpu_simple_resource *res,
-                                        Error **errp)
+void virtio_gpu_resource_destroy(VirtIOGPU *g,
+                                 struct virtio_gpu_simple_resource *res,
+                                 Error **errp)
 {
     int i;
 
@@ -665,6 +675,10 @@ static bool virtio_gpu_do_set_scanout(VirtIOGPU *g,
         void *ptr = data + fb->offset;
         rect = pixman_image_create_bits(fb->format, r->width, r->height,
                                         ptr, fb->stride);
+        if (!rect) {
+            *error = VIRTIO_GPU_RESP_ERR_UNSPEC;
+            return false;
+        }
 
         if (res->image) {
             pixman_image_ref(res->image);
@@ -1045,14 +1059,15 @@ static void virtio_gpu_handle_cursor_cb(VirtIODevice *vdev, VirtQueue *vq)
 
 void virtio_gpu_process_cmdq(VirtIOGPU *g)
 {
-    struct virtio_gpu_ctrl_command *cmd, *tmp;
+    struct virtio_gpu_ctrl_command *cmd;
     VirtIOGPUClass *vgc = VIRTIO_GPU_GET_CLASS(g);
 
     if (g->processing_cmdq) {
         return;
     }
     g->processing_cmdq = true;
-    QTAILQ_FOREACH_SAFE(cmd, &g->cmdq, next, tmp) {
+    while (!QTAILQ_EMPTY(&g->cmdq)) {
+        cmd = QTAILQ_FIRST(&g->cmdq);
 
         if (g->parent_obj.renderer_blocked) {
             break;
@@ -1061,14 +1076,25 @@ void virtio_gpu_process_cmdq(VirtIOGPU *g)
         /* process command */
         vgc->process_cmd(g, cmd);
 
-        /* command suspended (e.g. async blob unmap waiting for RCU) —
-         * leave it in the queue and continue processing later commands.
-         * This prevents a single suspended blob unmap from blocking ALL
-         * command processing across all GPU contexts, which caused
-         * virtio ring starvation and guest deadlock with 4+ desktops. */
-        if (!cmd->finished && !(cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_FENCE)) {
-            trace_virtio_gpu_cmd_suspended(cmd->cmd_hdr.type);
+        /*
+         * A deferred command is owned by whoever deferred it, which responds
+         * and frees it once its host-side work lands.  Unlike a suspended
+         * command it must not hold up the queue behind it.
+         */
+        if (cmd->deferred) {
+            QTAILQ_REMOVE(&g->cmdq, cmd, next);
             continue;
+        }
+
+        /*
+         * A suspended command has not registered its fence (if any) yet
+         * and must be re-processed at the cmdq head after resume, so it
+         * must not be moved to fenceq like a normal in-flight fence.
+         */
+        if (cmd->suspended ||
+            (!cmd->finished && !(cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_FENCE))) {
+            trace_virtio_gpu_cmd_suspended(cmd->cmd_hdr.type);
+            break;
         }
 
         QTAILQ_REMOVE(&g->cmdq, cmd, next);
@@ -1130,6 +1156,8 @@ static void virtio_gpu_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
         cmd->vq = vq;
         cmd->error = 0;
         cmd->finished = false;
+        cmd->suspended = false;
+        cmd->deferred = false;
         QTAILQ_INSERT_TAIL(&g->cmdq, cmd, next);
         cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
     }
@@ -1301,7 +1329,7 @@ static int virtio_gpu_load(QEMUFile *f, void *opaque, size_t size,
 {
     VirtIOGPU *g = opaque;
     struct virtio_gpu_simple_resource *res;
-    uint32_t resource_id, pformat;
+    uint32_t resource_id, pformat, hostmem;
     int i;
 
     g->hostmem = 0;
@@ -1327,7 +1355,11 @@ static int virtio_gpu_load(QEMUFile *f, void *opaque, size_t size,
             return -EINVAL;
         }
 
-        res->hostmem = calc_image_hostmem(pformat, res->width, res->height);
+        if (!calc_image_hostmem(pformat, res->width, res->height, &hostmem)) {
+            g_free(res);
+            return -EINVAL;
+        }
+        res->hostmem = hostmem;
         if (!qemu_pixman_image_new_shareable(&res->image,
                                              &res->share_handle,
                                              "virtio-gpu res",
@@ -1340,8 +1372,15 @@ static int virtio_gpu_load(QEMUFile *f, void *opaque, size_t size,
             return -EINVAL;
         }
 
-        res->addrs = g_new(uint64_t, res->iov_cnt);
-        res->iov = g_new(struct iovec, res->iov_cnt);
+        res->addrs = g_try_new(uint64_t, res->iov_cnt);
+        res->iov = g_try_new(struct iovec, res->iov_cnt);
+        if (res->iov_cnt && (!res->addrs || !res->iov)) {
+            pixman_image_unref(res->image);
+            g_free(res->addrs);
+            g_free(res->iov);
+            g_free(res);
+            return -EINVAL;
+        }
 
         /* read data */
         for (i = 0; i < res->iov_cnt; i++) {
@@ -1413,8 +1452,15 @@ static int virtio_gpu_blob_load(QEMUFile *f, void *opaque, size_t size,
         res->resource_id = resource_id;
         res->blob_size = qemu_get_be32(f);
         res->iov_cnt = qemu_get_be32(f);
-        res->addrs = g_new(uint64_t, res->iov_cnt);
-        res->iov = g_new(struct iovec, res->iov_cnt);
+
+        res->addrs = g_try_new(uint64_t, res->iov_cnt);
+        res->iov = g_try_new(struct iovec, res->iov_cnt);
+        if (res->iov_cnt && (!res->addrs || !res->iov)) {
+            g_free(res->addrs);
+            g_free(res->iov);
+            g_free(res);
+            return -EINVAL;
+        }
 
         /* read data */
         for (i = 0; i < res->iov_cnt; i++) {
@@ -1494,6 +1540,10 @@ void virtio_gpu_device_realize(DeviceState *qdev, Error **errp)
     if (virtio_gpu_blob_enabled(g->parent_obj.conf)) {
 #ifdef CONFIG_METAL
         have_ext_memory = virtio_gpu_venus_enabled(g->parent_obj.conf);
+#ifdef HAVE_VIRGL_RENDERER_NEPTUNE
+        have_ext_memory = have_ext_memory ||
+            virtio_gpu_neptune_enabled(g->parent_obj.conf);
+#endif
 #else
         have_ext_memory = virtio_gpu_have_udmabuf();
 #endif
@@ -1529,6 +1579,19 @@ void virtio_gpu_device_realize(DeviceState *qdev, Error **errp)
 #endif
     }
 
+    if (virtio_gpu_neptune_enabled(g->parent_obj.conf)) {
+#ifdef HAVE_VIRGL_RENDERER_NEPTUNE
+        if (!virtio_gpu_blob_enabled(g->parent_obj.conf) ||
+            !virtio_gpu_hostmem_enabled(g->parent_obj.conf)) {
+            error_setg(errp, "neptune requires enabled blob and hostmem options");
+            return;
+        }
+#else
+        error_setg(errp, "virglrenderer does not support neptune");
+        return;
+#endif
+    }
+
     if (!virtio_gpu_base_device_realize(qdev,
                                         virtio_gpu_handle_ctrl_cb,
                                         virtio_gpu_handle_cursor_cb,
@@ -1538,9 +1601,9 @@ void virtio_gpu_device_realize(DeviceState *qdev, Error **errp)
 
     g->ctrl_vq = virtio_get_queue(vdev, 0);
     g->cursor_vq = virtio_get_queue(vdev, 1);
-    g->ctrl_bh = virtio_bh_new_guarded(qdev, virtio_gpu_ctrl_bh, g);
-    g->cursor_bh = virtio_bh_new_guarded(qdev, virtio_gpu_cursor_bh, g);
-    g->reset_bh = qemu_bh_new(virtio_gpu_reset_bh, g);
+    g->ctrl_bh = virtio_bh_io_new_guarded(qdev, virtio_gpu_ctrl_bh, g);
+    g->cursor_bh = virtio_bh_io_new_guarded(qdev, virtio_gpu_cursor_bh, g);
+    g->reset_bh = virtio_bh_io_new_guarded(qdev, virtio_gpu_reset_bh, g);
     qemu_cond_init(&g->reset_cond);
     QTAILQ_INIT(&g->reslist);
     QTAILQ_INIT(&g->cmdq);

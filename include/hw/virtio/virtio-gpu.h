@@ -15,6 +15,7 @@
 #define HW_VIRTIO_GPU_H
 
 #include "qemu/queue.h"
+#include "qemu/units.h"
 #include "ui/qemu-pixman.h"
 #include "ui/console.h"
 #include "hw/virtio/virtio.h"
@@ -99,6 +100,7 @@ enum virtio_gpu_base_conf_flags {
     VIRTIO_GPU_FLAG_RUTABAGA_ENABLED,
     VIRTIO_GPU_FLAG_VENUS_ENABLED,
     VIRTIO_GPU_FLAG_RESOURCE_UUID_ENABLED,
+    VIRTIO_GPU_FLAG_NEPTUNE_ENABLED,
 };
 
 #define virtio_gpu_virgl_enabled(_cfg) \
@@ -121,6 +123,8 @@ enum virtio_gpu_base_conf_flags {
     (_cfg.hostmem > 0)
 #define virtio_gpu_venus_enabled(_cfg) \
     (_cfg.flags & (1 << VIRTIO_GPU_FLAG_VENUS_ENABLED))
+#define virtio_gpu_neptune_enabled(_cfg) \
+    (_cfg.flags & (1 << VIRTIO_GPU_FLAG_NEPTUNE_ENABLED))
 
 struct virtio_gpu_base_conf {
     uint32_t max_outputs;
@@ -136,6 +140,14 @@ struct virtio_gpu_ctrl_command {
     struct virtio_gpu_ctrl_hdr cmd_hdr;
     uint32_t error;
     bool finished;
+    /* Set if process_cmd deferred completion; keep at cmdq head for resume. */
+    bool suspended;
+    /*
+     * Set if process_cmd took ownership of the command to complete it later
+     * (a mapped blob's teardown waits for the memory region to finalize):
+     * it leaves cmdq without a response and without blocking the queue.
+     */
+    bool deferred;
     QTAILQ_ENTRY(virtio_gpu_ctrl_command) next;
 };
 
@@ -175,6 +187,15 @@ struct VirtIOGPUBaseClass {
 typedef struct VGPUDMABuf {
     QemuDmaBuf *buf;
     uint32_t scanout_id;
+    /* Source identity of the scanout request that created this dmabuf, so a
+     * re-present of the SAME underlying buffer -- including a flip chain
+     * alternating between a small set of buffers -- can switch scanout
+     * without a costly EGL/GL re-import (which churns/hangs the display
+     * thread). */
+    int src_fd;
+    uint32_t src_res_id;
+    uint32_t src_w, src_h, src_x, src_y;
+    uint32_t fb_w, fb_h, fb_stride, fb_format;
     QTAILQ_ENTRY(VGPUDMABuf) next;
 } VGPUDMABuf;
 
@@ -232,6 +253,13 @@ struct VirtIOGPUClass {
                              Error **errp);
 };
 
+struct virtio_gpu_virgl_context_fence {
+    uint32_t ctx_id;
+    uint32_t ring_idx;
+    uint64_t fence_id;
+    QSLIST_ENTRY(virtio_gpu_virgl_context_fence) next;
+};
+
 /* VirtIOGPUGL renderer states */
 typedef enum {
     RS_START,       /* starting state */
@@ -239,6 +267,8 @@ typedef enum {
     RS_INITED,      /* initialised and working */
     RS_RESET,       /* inited and reset pending, moves to start after reset */
 } RenderState;
+
+struct virtio_gpu_virgl_hostmem_region;
 
 struct VirtIOGPUGL {
     struct VirtIOGPU parent_obj;
@@ -249,12 +279,14 @@ struct VirtIOGPUGL {
     QEMUTimer *print_stats;
 
     QEMUBH *cmdq_resume_bh;
+    /* Hostmem regions whose MemoryRegion finalized; cmdq_resume_bh finishes
+     * their unmap (and any deferred unref) on the main loop. */
+    QTAILQ_HEAD(, virtio_gpu_virgl_hostmem_region) unmap_done_list;
 
-    /* Thread-based fence polling — bypasses QEMU timer system which
-     * fails to fire fence_poll on macOS/HVF for unknown reasons. */
-    QEMUBH *fence_poll_bh;
-    QemuThread fence_poll_thread;
-    bool fence_poll_thread_running;
+    QEMUBH *async_fence_bh;
+    QSLIST_HEAD(, virtio_gpu_virgl_context_fence) async_fenceq;
+    /* fences retire via async_fence_bh; fence_poll is only a watchdog */
+    bool async_fence_enabled;
 };
 
 struct VhostUserGPU {
@@ -287,6 +319,14 @@ struct VirtIOGPURutabaga {
     uint32_t num_capsets;
     struct rutabaga *rutabaga;
 };
+
+/*
+ * With 4 KiB pages and QEMU's VIRTQUEUE_MAX_SIZE (1024) mapped-iov
+ * limit, the largest inline command is ~4 MiB.  Cap submit_3d
+ * allocations to this value to prevent a malicious guest from
+ * triggering an OOM abort via an inflated cs.size field.
+ */
+#define VIRTIO_GPU_MAX_CMD_SUBMIT_SIZE (4 * MiB)
 
 #define VIRTIO_GPU_FILL_CMD(out) do {                                   \
         size_t virtiogpufillcmd_s_ =                                    \
@@ -340,6 +380,9 @@ void virtio_gpu_cleanup_mapping(VirtIOGPU *g,
 void virtio_gpu_process_cmdq(VirtIOGPU *g);
 void virtio_gpu_device_realize(DeviceState *qdev, Error **errp);
 void virtio_gpu_reset(VirtIODevice *vdev);
+void virtio_gpu_resource_destroy(VirtIOGPU *g,
+                                 struct virtio_gpu_simple_resource *res,
+                                 Error **errp);
 void virtio_gpu_simple_process_cmd(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd);
 void virtio_gpu_update_cursor_data(VirtIOGPU *g,
                                    struct virtio_gpu_scanout *s,
@@ -383,7 +426,11 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
 void virtio_gpu_virgl_fence_poll(VirtIOGPU *g);
 void virtio_gpu_virgl_reset_scanout(VirtIOGPU *g);
 void virtio_gpu_virgl_reset(VirtIOGPU *g);
+void virtio_gpu_virgl_resource_destroy(VirtIOGPU *g,
+                                       struct virtio_gpu_simple_resource *res,
+                                       Error **errp);
 int virtio_gpu_virgl_init(VirtIOGPU *g);
 GArray *virtio_gpu_virgl_get_capsets(VirtIOGPU *g);
+void virtio_gpu_virgl_reset_async_fences(VirtIOGPU *g);
 
 #endif

@@ -21,7 +21,7 @@
 #include "ui/clipboard.h"
 #include "ui/console.h"
 #include "ui/kbd-state.h"
-#if defined(CONFIG_OPENGL)
+#if defined(CONFIG_OPENGL) && defined(CONFIG_EGL)
 #include "ui/egl-helpers.h"
 #include "ui/egl-context.h"
 #endif
@@ -43,7 +43,7 @@ typedef struct VirtualGfxConsole {
     cairo_surface_t *surface;
     double scale_x;
     double scale_y;
-#if defined(CONFIG_OPENGL)
+#if defined(CONFIG_OPENGL) && defined(CONFIG_EGL)
     QemuGLShader *gls;
     EGLContext ectx;
     EGLSurface esurface;
@@ -157,6 +157,7 @@ extern bool gtk_use_gl_area;
 void gd_update_windowsize(VirtualConsole *vc);
 void gd_update_monitor_refresh_rate(VirtualConsole *vc, GtkWidget *widget);
 void gd_hw_gl_flushed(void *vc);
+void gd_dmabuf_cancel_fence(VirtualConsole *vc, QemuDmaBuf *dmabuf);
 
 /* ui/gtk-egl.c */
 void gd_egl_init(VirtualConsole *vc);
@@ -223,5 +224,7 @@ int gd_gl_area_make_current(DisplayGLCtx *dgc,
 
 /* gtk-clipboard.c */
 void gd_clipboard_init(GtkDisplayState *gd);
+
+void gd_update_scale(VirtualConsole *vc, int ww, int wh, int fbw, int fbh);
 
 #endif /* UI_GTK_H */

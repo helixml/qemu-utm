@@ -22,6 +22,7 @@
 
 #include "kvm-consts.h"
 #include "qemu/cpu-float.h"
+#include "qemu/seqlock.h"
 #include "hw/registerfields.h"
 #include "cpu-qom.h"
 #include "exec/cpu-defs.h"
@@ -900,6 +901,14 @@ struct ArchCPU {
      * pmu_op_finish() - it does not need other handling during migration
      */
     QEMUTimer *pmu_timer;
+    /*
+     * Write side is taken (by pmu_op_start/finish) around every span that
+     * transiently holds the PMU counter state in a mixed form, so BQL-free
+     * readers of that state (the HVF PMCCNTR_EL0 read fast path) can
+     * detect a concurrent update by arm_pmu_timer_cb() on the main-loop
+     * thread and fall back to the locked path.  All writers hold the BQL.
+     */
+    QemuSeqLock pmu_op_lock;
     /* Timer used for WFxT timeouts */
     QEMUTimer *wfxt_timer;
 
@@ -1125,6 +1134,7 @@ struct ArchCPU {
 
     /* Used to set the maximum vector length the cpu will support.  */
     uint32_t sve_max_vq;
+    uint32_t sme_max_vq;
 
 #ifdef CONFIG_USER_ONLY
     /* Used to set the default vector length at process start. */
@@ -1312,6 +1322,18 @@ static inline bool is_a64(CPUARMState *env)
  */
 void pmu_op_start(CPUARMState *env);
 void pmu_op_finish(CPUARMState *env);
+
+/**
+ * pmu_evcntr_delta_rebaseline
+ * @env: CPUARMState
+ *
+ * Recompute the event-counter delta baselines from the current contents of
+ * c14_pmevtyper[].  Required after event types have been loaded raw behind
+ * the back of an enclosing pmu_op_start(), whose baselines were computed
+ * with the pre-load event types, so that the closing pmu_op_finish()
+ * converts the loaded counter values using the right events.
+ */
+void pmu_evcntr_delta_rebaseline(CPUARMState *env);
 
 /*
  * Called when a PMU counter is due to overflow

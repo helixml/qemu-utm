@@ -202,6 +202,13 @@ virgl_cmd_submit_3d(VuGpu *g,
 
     VUGPU_FILL_CMD(cs);
 
+    if (cs.size > VIRTIO_GPU_MAX_CMD_SUBMIT_SIZE) {
+        g_critical("%s: command buffer too large (%u)",
+                   __func__, cs.size);
+        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+        return;
+    }
+
     buf = g_malloc(cs.size);
     s = iov_to_buf(cmd->elem.out_sg, cmd->elem.out_num,
                    sizeof(cs), buf, cs.size);
@@ -354,7 +361,7 @@ virgl_cmd_set_scanout(VuGpu *g,
                       struct virtio_gpu_ctrl_command *cmd)
 {
     struct virtio_gpu_set_scanout ss;
-    struct virgl_renderer_texture_info info;
+    struct virgl_renderer_resource_info info;
     int ret;
 
     VUGPU_FILL_CMD(ss);
