@@ -94,6 +94,9 @@ static void virtio_gpu_gl_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
         cmd->error = 0;
         cmd->finished = false;
         cmd->suspended = false;
+        /* virtqueue_pop() does not zero the element; a stale value here
+         * makes process_cmdq() drop the command without a response. */
+        cmd->deferred = false;
         QTAILQ_INSERT_TAIL(&g->cmdq, cmd, next);
         cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
     }

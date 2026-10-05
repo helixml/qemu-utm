@@ -125,6 +125,20 @@ bool virtio_gpu_get_scanout_surface_data(void *virtio_gpu,
      VIRGL_VERSION_MICRO >= (micro))
 #endif
 
+/*
+ * Retake the BQL dropped around a blocking virglrenderer call.  Command
+ * processing runs in reentrancy-guarded BHs, so a vCPU ringing the control
+ * queue doorbell while the BQL was released is discarded ("Blocked
+ * re-entrant IO"), and with VIRTIO_RING_F_EVENT_IDX the guest will not ring
+ * again until we pop the queue: its commands would be stranded and every
+ * fence behind them would hang.  Rerun the control handler to pick them up.
+ */
+static void virgl_bql_relock(VirtIOGPU *g)
+{
+    bql_lock();
+    qemu_bh_schedule(g->ctrl_bh);
+}
+
 struct virtio_gpu_virgl_resource {
     struct virtio_gpu_simple_resource base;
     MemoryRegion *mr;
@@ -630,7 +644,7 @@ static void virgl_cmd_resource_unref(VirtIOGPU *g,
      * See: design/2026-02-28-multi-desktop-cfrelease-deadlock.md */
     bql_unlock();
     virgl_renderer_resource_unref(unref.resource_id);
-    bql_lock();
+    virgl_bql_relock(g);
 
     g_free(res);
 }
@@ -1206,7 +1220,7 @@ static void virgl_cmd_resource_create_blob(VirtIOGPU *g,
      * state, so dropping the BQL is safe. */
     bql_unlock();
     ret = virgl_renderer_resource_create_blob(&virgl_args);
-    bql_lock();
+    virgl_bql_relock(g);
     if (ret) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: virgl blob create error: %s\n",
                       __func__, strerror(-ret));
@@ -1226,7 +1240,7 @@ static void virgl_cmd_resource_create_blob(VirtIOGPU *g,
          * Resource was never added to reslist, so no QTAILQ_REMOVE needed. */
         bql_unlock();
         virgl_renderer_resource_unref(cblob.resource_id);
-        bql_lock();
+        virgl_bql_relock(g);
         return;
     }
 
