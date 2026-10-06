@@ -199,14 +199,65 @@ void hvf_arm_init_debug(void)
 #define SYSREG_PMUSERENR_EL0  SYSREG(3, 3, 9, 14, 0)
 #define SYSREG_PMCNTENSET_EL0 SYSREG(3, 3, 9, 12, 1)
 #define SYSREG_PMCNTENCLR_EL0 SYSREG(3, 3, 9, 12, 2)
+#define SYSREG_PMINTENSET_EL1 SYSREG(3, 0, 9, 14, 1)
 #define SYSREG_PMINTENCLR_EL1 SYSREG(3, 0, 9, 14, 2)
 #define SYSREG_PMOVSCLR_EL0   SYSREG(3, 3, 9, 12, 3)
+#define SYSREG_PMOVSSET_EL0   SYSREG(3, 3, 9, 14, 3)
 #define SYSREG_PMSWINC_EL0    SYSREG(3, 3, 9, 12, 4)
 #define SYSREG_PMSELR_EL0     SYSREG(3, 3, 9, 12, 5)
 #define SYSREG_PMCEID0_EL0    SYSREG(3, 3, 9, 12, 6)
 #define SYSREG_PMCEID1_EL0    SYSREG(3, 3, 9, 12, 7)
 #define SYSREG_PMCCNTR_EL0    SYSREG(3, 3, 9, 13, 0)
+#define SYSREG_PMXEVTYPER_EL0 SYSREG(3, 3, 9, 13, 1)
+#define SYSREG_PMXEVCNTR_EL0  SYSREG(3, 3, 9, 13, 2)
 #define SYSREG_PMCCFILTR_EL0  SYSREG(3, 3, 14, 15, 7)
+
+/*
+ * PMEVCNTR<n>_EL0:  op0=3 op1=3 crn=14 crm=0b10:n<4:3> op2=n<2:0>
+ * PMEVTYPER<n>_EL0: op0=3 op1=3 crn=14 crm=0b11:n<4:3> op2=n<2:0>
+ * for n = 0..30 (the would-be n = 31 typer encoding is PMCCFILTR_EL0,
+ * which has its own case; the n = 31 counter encoding is unallocated).
+ */
+static bool sysreg_is_pmev(uint32_t reg)
+{
+    unsigned n;
+
+    if (SYSREG_OP0(reg) != 3 || SYSREG_OP1(reg) != 3 ||
+        SYSREG_CRN(reg) != 14 || SYSREG_CRM(reg) < 8) {
+        return false;
+    }
+    n = (SYSREG_CRM(reg) & 3) * 8 + SYSREG_OP2(reg);
+    return n <= 30;
+}
+
+/*
+ * The PMUv3 registers this file routes to the QEMU PMU model's cpreg
+ * handlers (helper.c define_pmu_regs() and friends).
+ */
+static bool sysreg_is_pmu(uint32_t reg)
+{
+    switch (reg) {
+    case SYSREG_PMCR_EL0:
+    case SYSREG_PMUSERENR_EL0:
+    case SYSREG_PMCNTENSET_EL0:
+    case SYSREG_PMCNTENCLR_EL0:
+    case SYSREG_PMINTENSET_EL1:
+    case SYSREG_PMINTENCLR_EL1:
+    case SYSREG_PMOVSCLR_EL0:
+    case SYSREG_PMOVSSET_EL0:
+    case SYSREG_PMSWINC_EL0:
+    case SYSREG_PMSELR_EL0:
+    case SYSREG_PMCEID0_EL0:
+    case SYSREG_PMCEID1_EL0:
+    case SYSREG_PMCCNTR_EL0:
+    case SYSREG_PMXEVTYPER_EL0:
+    case SYSREG_PMXEVCNTR_EL0:
+    case SYSREG_PMCCFILTR_EL0:
+        return true;
+    default:
+        return sysreg_is_pmev(reg);
+    }
+}
 
 #define SYSREG_ICC_AP0R0_EL1     SYSREG(3, 0, 12, 8, 4)
 #define SYSREG_ICC_AP0R1_EL1     SYSREG(3, 0, 12, 8, 5)
@@ -893,7 +944,7 @@ static bool hvf_arm_get_host_cpu_features(ARMHostCPUFeatures *ahcf)
     hv_vcpu_exit_t *exit;
     int i;
 
-    ahcf->dtb_compatible = "arm,arm-v8";
+    ahcf->dtb_compatible = "arm,armv8";
     ahcf->features = (1ULL << ARM_FEATURE_V8) |
                      (1ULL << ARM_FEATURE_NEON) |
                      (1ULL << ARM_FEATURE_AARCH64) |
@@ -929,6 +980,26 @@ static bool hvf_arm_get_host_cpu_features(ARMHostCPUFeatures *ahcf)
      *   on the M4 there is SME but not SVE)
      */
     host_isar.id_aa64pfr1 &= ~R_ID_AA64PFR1_SME_MASK;
+
+    /*
+     * Apple silicon has no architected PMUv3 (the host's
+     * ID_AA64DFR0_EL1.PMUVer is 0); every PMU register access from the
+     * guest traps and QEMU emulates the whole unit, counting cycles on the
+     * virtual clock (helper.c pm_events) and raising the overflow PPI from
+     * the pmu_timer.  Advertise base PMUv3 with six event counters so
+     * guests get a real sampling source (Windows' ETW profiler refuses to
+     * sample with PMUVer == 0; note Windows reads PMCCNTR_EL0 even with
+     * PMUVer == 0, so -cpu host,pmu=off cannot boot it).  PMUVER lands in
+     * the vCPU's ID_AA64DFR0_EL1 via the cpreg resetvalue that
+     * hvf_put_registers() pushes before the first run (realize zeroes it
+     * again for pmu=off); PMCR_EL0.N comes from reset_pmcr_el0 via the
+     * PMCR cpreg resetvalue and pmu_num_counters().  PMCR_EL0.{IMP,IDCODE}
+     * are left 0 like the TCG CPUs that don't model a specific
+     * implementation's PMU.
+     */
+    host_isar.id_aa64dfr0 = FIELD_DP64(host_isar.id_aa64dfr0, ID_AA64DFR0,
+                                       PMUVER, 1);
+    host_isar.reset_pmcr_el0 = 6 << PMCRN_SHIFT;    /* six event counters */
 
     ahcf->isar = host_isar;
 
@@ -1213,6 +1284,13 @@ int hvf_arch_init_vcpu(CPUState *cpu)
     ret = hv_vcpu_set_sys_reg(cpu->accel->fd, HV_SYS_REG_ID_AA64PFR0_EL1, pfr);
     assert_hvf_ok(ret);
 
+    /*
+     * ID_AA64DFR0_EL1 (which carries the emulated PMU's PMUVer, including
+     * the 0 of -cpu host,pmu=off) needs no manual sync: it is in
+     * hvf_sreg_match[], so hvf_put_registers() pushes the model's value
+     * from the cpreg resetvalue before the first run.
+     */
+
     /* We're limited to underlying hardware caps, override internal versions */
     ret = hv_vcpu_get_sys_reg(cpu->accel->fd, HV_SYS_REG_ID_AA64MMFR0_EL1,
                               &arm_cpu->isar.id_aa64mmfr0);
@@ -1242,7 +1320,21 @@ int hvf_arch_init_vcpu(CPUState *cpu)
 
 void hvf_kick_vcpu_thread(CPUState *cpu)
 {
-    cpus_kick_thread(cpu);
+    /*
+     * Do not use cpus_kick_thread(): its thread_kicked dedup races with
+     * hvf_wait_for_ipi() clearing thread_kicked right before an unbounded
+     * pselect(). A kick that is skipped because thread_kicked was still set
+     * from an already-consumed kick is lost forever: the vCPU sleeps in WFI
+     * with the interrupt (or stop request) pending, which delays guest
+     * interrupts indefinitely and deadlocks pause_all_vcpus() on guest
+     * reset (zombie VM). Always send the signal.
+     */
+    qatomic_set(&cpu->thread_kicked, true);
+    int err = pthread_kill(cpu->thread->thread, SIG_IPI);
+    if (err && err != ESRCH) {
+        fprintf(stderr, "qemu:%s: %s", __func__, strerror(err));
+        exit(1);
+    }
     hv_vcpus_exit(&cpu->accel->fd, 1);
 }
 
@@ -1441,48 +1533,80 @@ static bool hvf_sysreg_read_cp(CPUState *cpu, uint32_t reg, uint64_t *val)
     return false;
 }
 
-static int hvf_sysreg_read(CPUState *cpu, uint32_t reg, uint64_t *val)
+/*
+ * Route a PMUv3 register access to the QEMU PMU model's cpreg handlers.
+ *
+ * Unlike most cpregs (see the GICv3 note at the hvf_sysreg_read_cp() call
+ * sites), the PMU handlers are safe to call from here: they only touch the
+ * cp15 state, the pmu_timer and the overflow interrupt line, and never
+ * need a TCG context.  Routing through them keeps HVF on the same
+ * implementation TCG uses -- per-EL access checks (PMUSERENR_EL0),
+ * per-counter start/finish bracketing, the pre-FEAT_PMUv3p5 RES0 masking
+ * of event counters, and the delta re-baselining when an event type
+ * changes.
+ *
+ * The caller has refreshed env->pstate (hvf_sync_pstate()), so
+ * arm_current_el() is accurate for the access checks.
+ */
+static int hvf_sysreg_access_pmu(CPUState *cpu, uint32_t reg, uint64_t *val,
+                                 bool isread, uint64_t syndrome)
+{
+    ARMCPU *arm_cpu = ARM_CPU(cpu);
+    CPUARMState *env = &arm_cpu->env;
+    const ARMCPRegInfo *ri;
+    CPAccessResult res;
+
+    ri = get_arm_cp_reginfo(arm_cpu->cp_regs, hvf_reg2cp_reg(reg));
+    if (!ri || !cp_access_ok(arm_current_el(env), ri, isread)) {
+        /*
+         * No cpreg (an unimplemented counter index: PMEVCNTR<n>_EL0 with
+         * n >= PMCR_EL0.N) or a wrong-EL/wrong-direction access: UNDEF,
+         * as under TCG.
+         */
+        cpu_synchronize_state(cpu);
+        hvf_raise_exception(cpu, EXCP_UDEF, syn_uncategorized());
+        return 1;
+    }
+
+    res = ri->accessfn ? ri->accessfn(env, ri, isread) : CP_ACCESS_OK;
+    if (res != CP_ACCESS_OK) {
+        /*
+         * Mirror TCG's access_check_cp_reg(): a configurable trap (EL0
+         * denied by PMUSERENR_EL0) presents the sysreg-trap syndrome and
+         * CP_ACCESS_UNDEFINED is uncategorized.  Without EL2/EL3 the only
+         * reachable target is EL1, which hvf_raise_exception() assumes.
+         */
+        cpu_synchronize_state(cpu);
+        hvf_raise_exception(cpu, EXCP_UDEF,
+                            res == CP_ACCESS_UNDEFINED ? syn_uncategorized() :
+                                                         (uint32_t)syndrome);
+        return 1;
+    }
+
+    if (isread) {
+        if (ri->type & ARM_CP_CONST) {
+            *val = ri->resetvalue;
+        } else if (ri->readfn) {
+            *val = ri->readfn(env, ri);
+        } else {
+            *val = CPREG_FIELD64(env, ri);
+        }
+    } else if (ri->writefn) {
+        ri->writefn(env, ri, *val);
+    } else {
+        CPREG_FIELD64(env, ri) = *val;
+    }
+    return 0;
+}
+
+static int hvf_sysreg_read(CPUState *cpu, uint32_t reg, uint64_t syndrome,
+                           uint64_t *val)
 {
     ARMCPU *arm_cpu = ARM_CPU(cpu);
     CPUARMState *env = &arm_cpu->env;
 
-    if (arm_feature(env, ARM_FEATURE_PMU)) {
-        switch (reg) {
-        case SYSREG_PMCR_EL0:
-            *val = env->cp15.c9_pmcr;
-            return 0;
-        case SYSREG_PMCCNTR_EL0:
-            pmu_op_start(env);
-            *val = env->cp15.c15_ccnt;
-            pmu_op_finish(env);
-            return 0;
-        case SYSREG_PMCNTENCLR_EL0:
-            *val = env->cp15.c9_pmcnten;
-            return 0;
-        case SYSREG_PMOVSCLR_EL0:
-            *val = env->cp15.c9_pmovsr;
-            return 0;
-        case SYSREG_PMSELR_EL0:
-            *val = env->cp15.c9_pmselr;
-            return 0;
-        case SYSREG_PMINTENCLR_EL1:
-            *val = env->cp15.c9_pminten;
-            return 0;
-        case SYSREG_PMCCFILTR_EL0:
-            *val = env->cp15.pmccfiltr_el0;
-            return 0;
-        case SYSREG_PMCNTENSET_EL0:
-            *val = env->cp15.c9_pmcnten;
-            return 0;
-        case SYSREG_PMUSERENR_EL0:
-            *val = env->cp15.c9_pmuserenr;
-            return 0;
-        case SYSREG_PMCEID0_EL0:
-        case SYSREG_PMCEID1_EL0:
-            /* We can't really count anything yet, declare all events invalid */
-            *val = 0;
-            return 0;
-        }
+    if (arm_feature(env, ARM_FEATURE_PMU) && sysreg_is_pmu(reg)) {
+        return hvf_sysreg_access_pmu(cpu, reg, val, true, syndrome);
     }
 
     switch (reg) {
@@ -1517,6 +1641,7 @@ static int hvf_sysreg_read(CPUState *cpu, uint32_t reg, uint64_t *val)
     case SYSREG_ICC_IGRPEN0_EL1:
     case SYSREG_ICC_IGRPEN1_EL1:
     case SYSREG_ICC_PMR_EL1:
+    case SYSREG_ICC_RPR_EL1:
     case SYSREG_ICC_SGI0R_EL1:
     case SYSREG_ICC_SGI1R_EL1:
     case SYSREG_ICC_SRE_EL1:
@@ -1617,82 +1742,6 @@ static int hvf_sysreg_read(CPUState *cpu, uint32_t reg, uint64_t *val)
     return 1;
 }
 
-static void pmu_update_irq(CPUARMState *env)
-{
-    ARMCPU *cpu = env_archcpu(env);
-    qemu_set_irq(cpu->pmu_interrupt, (env->cp15.c9_pmcr & PMCRE) &&
-            (env->cp15.c9_pminten & env->cp15.c9_pmovsr));
-}
-
-static bool pmu_event_supported(uint16_t number)
-{
-    return false;
-}
-
-/* Returns true if the counter (pass 31 for PMCCNTR) should count events using
- * the current EL, security state, and register configuration.
- */
-static bool pmu_counter_enabled(CPUARMState *env, uint8_t counter)
-{
-    uint64_t filter;
-    bool enabled, filtered = true;
-    int el = arm_current_el(env);
-
-    enabled = (env->cp15.c9_pmcr & PMCRE) &&
-              (env->cp15.c9_pmcnten & (1 << counter));
-
-    if (counter == 31) {
-        filter = env->cp15.pmccfiltr_el0;
-    } else {
-        filter = env->cp15.c14_pmevtyper[counter];
-    }
-
-    if (el == 0) {
-        filtered = filter & PMXEVTYPER_U;
-    } else if (el == 1) {
-        filtered = filter & PMXEVTYPER_P;
-    }
-
-    if (counter != 31) {
-        /*
-         * If not checking PMCCNTR, ensure the counter is setup to an event we
-         * support
-         */
-        uint16_t event = filter & PMXEVTYPER_EVTCOUNT;
-        if (!pmu_event_supported(event)) {
-            return false;
-        }
-    }
-
-    return enabled && !filtered;
-}
-
-static void pmswinc_write(CPUARMState *env, uint64_t value)
-{
-    unsigned int i;
-    for (i = 0; i < pmu_num_counters(env); i++) {
-        /* Increment a counter's count iff: */
-        if ((value & (1 << i)) && /* counter's bit is set */
-                /* counter is enabled and not filtered */
-                pmu_counter_enabled(env, i) &&
-                /* counter is SW_INCR */
-                (env->cp15.c14_pmevtyper[i] & PMXEVTYPER_EVTCOUNT) == 0x0) {
-            /*
-             * Detect if this write causes an overflow since we can't predict
-             * PMSWINC overflows like we can for other events
-             */
-            uint32_t new_pmswinc = env->cp15.c14_pmevcntr[i] + 1;
-
-            if (env->cp15.c14_pmevcntr[i] & ~new_pmswinc & INT32_MIN) {
-                env->cp15.c9_pmovsr |= (1 << i);
-                pmu_update_irq(env);
-            }
-
-            env->cp15.c14_pmevcntr[i] = new_pmswinc;
-        }
-    }
-}
-
 static bool hvf_sysreg_write_cp(CPUState *cpu, uint32_t reg, uint64_t val)
 {
     ARMCPU *arm_cpu = ARM_CPU(cpu);
@@ -1720,7 +1769,8 @@ static bool hvf_sysreg_write_cp(CPUState *cpu, uint32_t reg, uint64_t val)
     return false;
 }
 
-static int hvf_sysreg_write(CPUState *cpu, uint32_t reg, uint64_t val)
+static int hvf_sysreg_write(CPUState *cpu, uint32_t reg, uint64_t syndrome,
+                            uint64_t val)
 {
     ARMCPU *arm_cpu = ARM_CPU(cpu);
     CPUARMState *env = &arm_cpu->env;
@@ -1733,66 +1783,8 @@ static int hvf_sysreg_write(CPUState *cpu, uint32_t reg, uint64_t val)
                            SYSREG_OP2(reg),
                            val);
 
-    if (arm_feature(env, ARM_FEATURE_PMU)) {
-        switch (reg) {
-        case SYSREG_PMCCNTR_EL0:
-            pmu_op_start(env);
-            env->cp15.c15_ccnt = val;
-            pmu_op_finish(env);
-            return 0;
-        case SYSREG_PMCR_EL0:
-            pmu_op_start(env);
-
-            if (val & PMCRC) {
-                /* The counter has been reset */
-                env->cp15.c15_ccnt = 0;
-            }
-
-            if (val & PMCRP) {
-                unsigned int i;
-                for (i = 0; i < pmu_num_counters(env); i++) {
-                    env->cp15.c14_pmevcntr[i] = 0;
-                }
-            }
-
-            env->cp15.c9_pmcr &= ~PMCR_WRITABLE_MASK;
-            env->cp15.c9_pmcr |= (val & PMCR_WRITABLE_MASK);
-
-            pmu_op_finish(env);
-            return 0;
-        case SYSREG_PMUSERENR_EL0:
-            env->cp15.c9_pmuserenr = val & 0xf;
-            return 0;
-        case SYSREG_PMCNTENSET_EL0:
-            env->cp15.c9_pmcnten |= (val & pmu_counter_mask(env));
-            return 0;
-        case SYSREG_PMCNTENCLR_EL0:
-            env->cp15.c9_pmcnten &= ~(val & pmu_counter_mask(env));
-            return 0;
-        case SYSREG_PMINTENCLR_EL1:
-            pmu_op_start(env);
-            env->cp15.c9_pminten |= val;
-            pmu_op_finish(env);
-            return 0;
-        case SYSREG_PMOVSCLR_EL0:
-            pmu_op_start(env);
-            env->cp15.c9_pmovsr &= ~val;
-            pmu_op_finish(env);
-            return 0;
-        case SYSREG_PMSWINC_EL0:
-            pmu_op_start(env);
-            pmswinc_write(env, val);
-            pmu_op_finish(env);
-            return 0;
-        case SYSREG_PMSELR_EL0:
-            env->cp15.c9_pmselr = val & 0x1f;
-            return 0;
-        case SYSREG_PMCCFILTR_EL0:
-            pmu_op_start(env);
-            env->cp15.pmccfiltr_el0 = val & PMCCFILTR_EL0;
-            pmu_op_finish(env);
-            return 0;
-        }
+    if (arm_feature(env, ARM_FEATURE_PMU) && sysreg_is_pmu(reg)) {
+        return hvf_sysreg_access_pmu(cpu, reg, &val, false, syndrome);
     }
 
     switch (reg) {
@@ -1831,6 +1823,7 @@ static int hvf_sysreg_write(CPUState *cpu, uint32_t reg, uint64_t val)
     case SYSREG_ICC_IGRPEN0_EL1:
     case SYSREG_ICC_IGRPEN1_EL1:
     case SYSREG_ICC_PMR_EL1:
+    case SYSREG_ICC_RPR_EL1:
     case SYSREG_ICC_SGI0R_EL1:
     case SYSREG_ICC_SGI1R_EL1:
     case SYSREG_ICC_SRE_EL1:
@@ -1966,12 +1959,27 @@ static uint64_t hvf_vtimer_val(void)
 static void hvf_wait_for_ipi(CPUState *cpu, struct timespec *ts)
 {
     /*
+     * Cap open-ended waits so that a lost kick degrades to a short delay
+     * instead of an unbounded sleep (defense in depth on top of the
+     * unconditional signal in hvf_kick_vcpu_thread()).
+     */
+    struct timespec bounded = { .tv_sec = 0, .tv_nsec = 10 * SCALE_MS };
+
+    /*
      * Use pselect to sleep so that other threads can IPI us while we're
      * sleeping.
      */
     qatomic_set_mb(&cpu->thread_kicked, false);
+    /*
+     * A kick sent before thread_kicked was cleared may have been deduped;
+     * re-check the conditions it would have signalled before sleeping.
+     */
+    if (qatomic_read(&cpu->stop) ||
+        (cpu->interrupt_request & (CPU_INTERRUPT_HARD | CPU_INTERRUPT_FIQ))) {
+        return;
+    }
     bql_unlock();
-    pselect(0, 0, 0, 0, ts, &cpu->accel->unblock_ipi_mask);
+    pselect(0, 0, 0, 0, ts ? ts : &bounded, &cpu->accel->unblock_ipi_mask);
     bql_lock();
 }
 
@@ -2044,6 +2052,107 @@ static void hvf_sync_vtimer(CPUState *cpu)
     }
 }
 
+/*
+ * Refresh env->pstate from the vCPU.  The sysreg trap handlers run without
+ * a full cpu_synchronize_state(), but the cpreg access checks and the PMU
+ * model depend on arm_current_el(env), which would otherwise be stuck at
+ * whatever the last full sync (or reset) left behind.
+ */
+static void hvf_sync_pstate(CPUState *cpu)
+{
+    uint64_t cpsr;
+    hv_return_t r;
+
+    if (cpu->accel->dirty) {
+        /* env is authoritative and about to be pushed; don't clobber it */
+        return;
+    }
+
+    r = hv_vcpu_get_reg(cpu->accel->fd, HV_REG_CPSR, &cpsr);
+    assert_hvf_ok(r);
+    pstate_write(&ARM_CPU(cpu)->env, cpsr);
+}
+
+/*
+ * PMCCNTR_EL0 read fast path.
+ *
+ * HVF cannot virtualize the PMU, so every guest read of the cycle counter
+ * is a full VM exit.  Windows on Arm reads it constantly -- its x64
+ * emulator implements RDTSC on it -- at hundreds of thousands of reads per
+ * second under an emulated game.  The general exit path takes the BQL,
+ * syncs the vtimer and returns to the vCPU thread loop for every one of
+ * them.  Serve the common case without any of that: the counter is
+ * enabled, unfiltered and 64-bit (no overflow interrupt to raise), so its
+ * value is a pure function of the virtual clock and this vCPU's own cp15
+ * state.  The only other writer of that state is arm_pmu_timer_cb() on the
+ * main-loop thread; pmu_op_start/finish flag its update spans via
+ * pmu_op_lock, which is checked before committing.  Returns false to take
+ * the general path.
+ */
+static bool hvf_pmccntr_read_fast(CPUState *cpu, uint64_t syndrome)
+{
+    ARMCPU *arm_cpu = ARM_CPU(cpu);
+    CPUARMState *env = &arm_cpu->env;
+    hv_return_t r;
+    unsigned seq;
+
+    if (!(syndrome & 1) || (syndrome & SYSREG_MASK) != SYSREG_PMCCNTR_EL0) {
+        return false;
+    }
+    if (cpu->singlestep_enabled || cpu->accel->dirty ||
+        cpu->accel->vtimer_masked) {
+        return false;
+    }
+
+    seq = seqlock_read_begin(&arm_cpu->pmu_op_lock);
+
+    if (!arm_feature(env, ARM_FEATURE_PMU) ||
+        (env->cp15.c9_pmcr & (PMCRE | PMCRLC)) != (PMCRE | PMCRLC) ||
+        !(env->cp15.c9_pmcnten & (1u << 31)) ||
+        (env->cp15.pmccfiltr_el0 & (PMXEVTYPER_P | PMXEVTYPER_U))) {
+        return false;
+    }
+
+    /*
+     * EL0 reads need PMUSERENR_EL0.{EN,CR}; when neither is set, bail if
+     * we are at EL0 so the general path can raise the access trap.
+     */
+    if (!(env->cp15.c9_pmuserenr & 0x5)) {
+        uint64_t cpsr;
+
+        r = hv_vcpu_get_reg(cpu->accel->fd, HV_REG_CPSR, &cpsr);
+        assert_hvf_ok(r);
+        if (((cpsr >> 2) & 3) == 0) {
+            return false;
+        }
+    }
+
+    /*
+     * Same value pmccntr_op_start would compute for the enabled counter
+     * (helper.c's cycles_get_count: 1 GHz on the virtual clock).
+     */
+    const uint64_t cycles = muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                                     1000000000, NANOSECONDS_PER_SECOND);
+    const uint64_t val = cycles - env->cp15.c15_ccnt_delta;
+    const uint32_t rt = (syndrome >> 5) & 0x1f;
+    uint64_t pc;
+
+    if (seqlock_read_retry(&arm_cpu->pmu_op_lock, seq)) {
+        /* Raced an update; the general path will read a settled value */
+        return false;
+    }
+
+    if (rt < 31) {
+        r = hv_vcpu_set_reg(cpu->accel->fd, HV_REG_X0 + rt, val);
+        assert_hvf_ok(r);
+    }
+    r = hv_vcpu_get_reg(cpu->accel->fd, HV_REG_PC, &pc);
+    assert_hvf_ok(r);
+    r = hv_vcpu_set_reg(cpu->accel->fd, HV_REG_PC, pc + 4);
+    assert_hvf_ok(r);
+    return true;
+}
+
 int hvf_vcpu_exec(CPUState *cpu)
 {
     ARMCPU *arm_cpu = ARM_CPU(cpu);
@@ -2064,13 +2173,31 @@ int hvf_vcpu_exec(CPUState *cpu)
 
     flush_cpu_state(cpu);
 
+    uint64_t exit_reason, syndrome;
+    uint32_t ec;
     bql_unlock();
+run_again:
     assert_hvf_ok(hv_vcpu_run(cpu->accel->fd));
 
     /* handle VMEXIT */
-    uint64_t exit_reason = hvf_exit->reason;
-    uint64_t syndrome = hvf_exit->exception.syndrome;
-    uint32_t ec = syn_get_ec(syndrome);
+    exit_reason = hvf_exit->reason;
+    syndrome = hvf_exit->exception.syndrome;
+    ec = syn_get_ec(syndrome);
+
+    if (exit_reason == HV_EXIT_REASON_EXCEPTION &&
+        ec == EC_SYSTEMREGISTERTRAP && hvf_pmccntr_read_fast(cpu, syndrome)) {
+        /*
+         * Served without the BQL.  Go straight back into the guest unless
+         * something is pending for the general path; a kick that raced us
+         * is sticky in HVF and surfaces as a CANCELED exit on the next run.
+         */
+        if (!qatomic_read(&cpu->interrupt_request) &&
+            !qatomic_read(&cpu->exit_request) && !cpu->halted) {
+            goto run_again;
+        }
+        bql_lock();
+        return 0;
+    }
 
     ret = 0;
     bql_lock();
@@ -2193,8 +2320,10 @@ int hvf_vcpu_exec(CPUState *cpu)
         uint64_t val;
         int sysreg_ret = 0;
 
+        hvf_sync_pstate(cpu);
+
         if (isread) {
-            sysreg_ret = hvf_sysreg_read(cpu, reg, &val);
+            sysreg_ret = hvf_sysreg_read(cpu, reg, syndrome, &val);
             if (!sysreg_ret) {
                 trace_hvf_sysreg_read(reg,
                                       SYSREG_OP0(reg),
@@ -2207,7 +2336,7 @@ int hvf_vcpu_exec(CPUState *cpu)
             }
         } else {
             val = hvf_get_reg(cpu, rt);
-            sysreg_ret = hvf_sysreg_write(cpu, reg, val);
+            sysreg_ret = hvf_sysreg_write(cpu, reg, syndrome, val);
         }
 
         advance_pc = !sysreg_ret;

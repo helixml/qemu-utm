@@ -212,10 +212,6 @@ void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
 
     assert(scon->opengl);
 
-    GLuint backing_texture = backing_borrow(backing_id, &backing_y_0_top,
-                                            &backing_width, &backing_height,
-                                            &d3d_tex2d);
-
     scon->x = x;
     scon->y = y;
     scon->w = w;

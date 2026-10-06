@@ -28,6 +28,7 @@
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <dispatch/dispatch.h>
+#include <dlfcn.h>
 
 #import <ParavirtualizedGraphics/ParavirtualizedGraphics.h>
 
@@ -740,6 +741,24 @@ static id<MTLDevice> copy_suitable_metal_device(void)
     return dev;
 }
 
+/*
+ * PGNewDeviceWithDescriptor is obsoleted in the macOS 27 SDK and no longer
+ * exported for linking. Use the replacement where available and look up the
+ * old symbol at runtime on older hosts. Both return a retained object.
+ */
+static id<PGDevice> apple_gfx_new_device(PGDeviceDescriptor *desc)
+{
+    id<PGDevice> (*new_device)(PGDeviceDescriptor *);
+
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150200
+    if (@available(macOS 15.2, *)) {
+        return PGCreateDeviceWithDescriptor(desc);
+    }
+#endif
+    new_device = dlsym(RTLD_DEFAULT, "PGNewDeviceWithDescriptor");
+    return new_device ? new_device(desc) : nil;
+}
+
 bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
                               PGDeviceDescriptor *desc, Error **errp)
 {
@@ -767,7 +786,11 @@ bool apple_gfx_common_realize(AppleGFXState *s, DeviceState *dev,
 
     s->cursor_show = true;
 
-    s->pgdev = PGNewDeviceWithDescriptor(desc);
+    s->pgdev = apple_gfx_new_device(desc);
+    if (!s->pgdev) {
+        error_setg(errp, "Failed to create ParavirtualizedGraphics device");
+        return false;
+    }
 
     disp_desc = apple_gfx_prepare_display_descriptor(s);
     /*
