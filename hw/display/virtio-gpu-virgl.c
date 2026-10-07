@@ -678,6 +678,33 @@ static void virgl_cmd_context_create(VirtIOGPU *g,
     virgl_renderer_context_create(cc.hdr.ctx_id, cc.nlen, cc.debug_name);
 }
 
+/*
+ * A context's ring fences are never signalled once it is destroyed, e.g. when
+ * the renderer killed it after a fatal error with submissions outstanding (a
+ * Venus context whose pipeline failed to compile). Complete its fenced commands
+ * instead of leaving them in the fenceq: the guest would wait on them forever,
+ * and with them anything sharing the GPU, until the whole VM hangs. Global
+ * (non-ring) fences need nothing: any later fence retires them in order.
+ */
+static void virtio_gpu_virgl_retire_context_fences(VirtIOGPU *g, uint32_t ctx_id)
+{
+    struct virtio_gpu_ctrl_command *cmd, *tmp;
+
+    QTAILQ_FOREACH_SAFE(cmd, &g->fenceq, next, tmp) {
+        if (cmd->cmd_hdr.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX &&
+            cmd->cmd_hdr.ctx_id == ctx_id) {
+            trace_virtio_gpu_fence_resp(cmd->cmd_hdr.fence_id);
+            virtio_gpu_ctrl_response_nodata(g, cmd, VIRTIO_GPU_RESP_OK_NODATA);
+            QTAILQ_REMOVE(&g->fenceq, cmd, next);
+            g_free(cmd);
+            g->inflight--;
+            if (virtio_gpu_stats_enabled(g->parent_obj.conf)) {
+                trace_virtio_gpu_dec_inflight_fences(g->inflight);
+            }
+        }
+    }
+}
+
 static void virgl_cmd_context_destroy(VirtIOGPU *g,
                                       struct virtio_gpu_ctrl_command *cmd)
 {
@@ -687,6 +714,7 @@ static void virgl_cmd_context_destroy(VirtIOGPU *g,
     trace_virtio_gpu_cmd_ctx_destroy(cd.hdr.ctx_id);
 
     virgl_renderer_context_destroy(cd.hdr.ctx_id);
+    virtio_gpu_virgl_retire_context_fences(g, cd.hdr.ctx_id);
 }
 
 static void virtio_gpu_rect_update(VirtIOGPU *g, int idx, int x, int y,
