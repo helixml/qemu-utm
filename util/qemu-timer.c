@@ -34,7 +34,7 @@
 #include <pthread.h>
 #endif
 
-#ifdef CONFIG_PPOLL
+#if defined(CONFIG_PPOLL) || defined(__APPLE__)
 #include <poll.h>
 #endif
 
@@ -319,6 +319,34 @@ int qemu_timeout_ns_to_ms(int64_t ns)
 }
 
 
+#if !defined(CONFIG_PPOLL) && defined(__APPLE__)
+/*
+ * glib's g_poll() on macOS is select(), which can't watch a file descriptor
+ * numbered FD_SETSIZE (1024) or above: every call faults (EXC_GUARD in
+ * __darwin_check_fd_set_overflow) and fails, so the main loop stops servicing
+ * I/O and the guest hangs. Slirp holds a host socket per guest TCP
+ * connection, so a busy guest gets past 1024 descriptors easily.
+ *
+ * glib avoids poll() on macOS because it reports POLLNVAL for device files
+ * such as /dev/null. select() treats those as always ready, so do the same.
+ */
+static int qemu_poll_macos(GPollFD *fds, guint nfds, int timeout_ms)
+{
+    struct pollfd *pfds = (struct pollfd *)fds;
+    int ret = poll(pfds, nfds, timeout_ms);
+
+    if (ret <= 0) {
+        return ret;
+    }
+    for (guint i = 0; i < nfds; i++) {
+        if ((pfds[i].revents & POLLNVAL) && fcntl(pfds[i].fd, F_GETFD) != -1) {
+            pfds[i].revents = pfds[i].events & (POLLIN | POLLOUT);
+        }
+    }
+    return ret;
+}
+#endif
+
 /* qemu implementation of g_poll which uses a nanosecond timeout but is
  * otherwise identical to g_poll
  */
@@ -340,6 +368,8 @@ int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
         ts.tv_nsec = timeout % 1000000000LL;
         return ppoll((struct pollfd *)fds, nfds, &ts, NULL);
     }
+#elif defined(__APPLE__)
+    return qemu_poll_macos(fds, nfds, qemu_timeout_ns_to_ms(timeout));
 #else
     return g_poll(fds, nfds, qemu_timeout_ns_to_ms(timeout));
 #endif
