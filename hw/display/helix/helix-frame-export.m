@@ -1148,9 +1148,10 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
     CMTime cmPts = CMTimeMake(pts, 1000000000);
     CMTime cmDuration = CMTimeMake(16666667, 1000000000);
 
-    /* Force keyframe on first frame only */
+    /* Force keyframe on the first frame and when a new client subscribed */
     CFMutableDictionaryRef frameProps = NULL;
-    if (enc->frame_count == 1) {
+    bool keyframe_requested = helix_atomic_xchg(&enc->keyframe_requested, false);
+    if (enc->frame_count == 1 || keyframe_requested) {
         frameProps = CFDictionaryCreateMutable(
             kCFAllocatorDefault, 1,
             &kCFTypeDictionaryKeyCallBacks,
@@ -1171,6 +1172,7 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
     if (!enc->session) {
         /* Encoder was torn down between our check and the lock */
         pthread_mutex_unlock(&fe->mutex);
+        if (keyframe_requested) helix_atomic_store(&enc->keyframe_requested, true);
         if (frameProps) CFRelease(frameProps);
         CVPixelBufferRelease(pixelBuffer);
         return;
@@ -1200,6 +1202,7 @@ void helix_scanout_frame_ready(void *virtio_gpu, uint32_t scanout_id,
         /* Encode failed — callback won't fire, so clear busy flags */
         helix_atomic_store(&enc->blit_slot_busy[slot], false);
         helix_atomic_store(&enc->vt_busy, false);
+        if (keyframe_requested) helix_atomic_store(&enc->keyframe_requested, true);
     } else {
         /* Track last successful blit for keepalive re-encoding.
          * The keepalive thread will re-submit this IOSurface when
@@ -1258,9 +1261,12 @@ static void *helix_keepalive_thread(void *arg)
                 continue;
             }
 
-            /* Check if enough time has elapsed since last frame */
+            /* Check if enough time has elapsed since last frame. A pending
+             * keyframe request skips the wait, so a client that just
+             * subscribed to a static screen gets a picture now. */
+            bool keyframe_pending = helix_atomic_load(&enc->keyframe_requested);
             uint64_t last_ns = helix_atomic_load(&enc->last_frame_ns);
-            if (last_ns == 0 || (now_ns - last_ns) < interval_ns) {
+            if (last_ns == 0 || (!keyframe_pending && (now_ns - last_ns) < interval_ns)) {
                 continue;
             }
 
@@ -1324,15 +1330,29 @@ static void *helix_keepalive_thread(void *arg)
             helix_atomic_store(&enc->blit_slot_busy[slot], true);
             helix_atomic_store(&enc->vt_busy, true);
 
+            CFMutableDictionaryRef frameProps = NULL;
+            bool keyframe_requested = helix_atomic_xchg(&enc->keyframe_requested, false);
+            if (keyframe_requested) {
+                frameProps = CFDictionaryCreateMutable(
+                    kCFAllocatorDefault, 1,
+                    &kCFTypeDictionaryKeyCallBacks,
+                    &kCFTypeDictionaryValueCallBacks);
+                CFDictionarySetValue(frameProps,
+                                     kVTEncodeFrameOptionKey_ForceKeyFrame,
+                                     kCFBooleanTrue);
+            }
+
             OSStatus encStatus = VTCompressionSessionEncodeFrame(
                 enc->session, pixelBuffer, cmPts, cmDuration,
-                NULL, (void *)(uintptr_t)slot, NULL);
+                frameProps, (void *)(uintptr_t)slot, NULL);
 
             pthread_mutex_unlock(&fe->mutex);
+            if (frameProps) CFRelease(frameProps);
 
             if (encStatus != noErr) {
                 helix_atomic_store(&enc->blit_slot_busy[slot], false);
                 helix_atomic_store(&enc->vt_busy, false);
+                if (keyframe_requested) helix_atomic_store(&enc->keyframe_requested, true);
             } else {
                 /* Update last_frame_ns to prevent rapid re-firing */
                 struct timespec ts2;
@@ -1470,6 +1490,12 @@ static void *client_handler_thread(void *arg)
             if (!ok) {
                 helix_log("[HELIX] Client %d: failed to send SUBSCRIBE_RESP", client_idx);
                 break;
+            }
+
+            /* Start the new client on a keyframe. Set only after the
+             * response is out, so the keyframe can't overtake it. */
+            if (scanout_id < HELIX_MAX_SCANOUTS) {
+                helix_atomic_store(&fe->scanout_encoders[scanout_id].keyframe_requested, true);
             }
 
         } else if (header.msg_type == HELIX_MSG_ENABLE_SCANOUT) {
@@ -1683,7 +1709,7 @@ void helix_frame_export_cleanup(HelixFrameExport *fe)
 int helix_frame_export_init(void *virtio_gpu, int vsock_port)
 {
     helix_log("========================================");
-    helix_log("[HELIX] VERSION: 2026-10-21-v17-utm-10.0.12-poll-high-fds");
+    helix_log("[HELIX] VERSION: 2026-10-29-v18-utm-10.0.12-keyframe-on-subscribe");
     helix_log("[HELIX] BUILD: merged utmapp/utm-edition (QEMU 10.0.12, render-server async fences), HVF WFI idle fix, vendored libslirp 4.9.5, ring 1024");
     helix_log("========================================");
     helix_log("[HELIX] Initializing frame export on vsock port %d", vsock_port);
