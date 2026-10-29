@@ -177,6 +177,11 @@ typedef struct HelixScanoutEncoder {
     uint32_t last_blit_slot;         /* Ring slot of last successful blit */
     bool has_blitted_frame;          /* True after first successful encode */
     volatile uint64_t last_frame_ns; /* CLOCK_MONOTONIC nanoseconds of last encode */
+    /* Set when a client subscribes mid-stream: it can decode nothing until a
+     * keyframe, and on a static screen the next scheduled one is up to
+     * MaxKeyFrameInterval keepalive frames (~30s) away. The next encode,
+     * page flip or keepalive, forces a keyframe and clears it. */
+    volatile bool keyframe_requested;
 
 } HelixScanoutEncoder;
 
