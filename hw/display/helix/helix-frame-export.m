@@ -1709,8 +1709,8 @@ void helix_frame_export_cleanup(HelixFrameExport *fe)
 int helix_frame_export_init(void *virtio_gpu, int vsock_port)
 {
     helix_log("========================================");
-    helix_log("[HELIX] VERSION: 2026-10-29-v18-utm-10.0.12-keyframe-on-subscribe");
-    helix_log("[HELIX] BUILD: merged utmapp/utm-edition (QEMU 10.0.12, render-server async fences), HVF WFI idle fix, vendored libslirp 4.9.5, ring 1024");
+    helix_log("[HELIX] VERSION: 2026-11-17-v19-utm-10.0.12-slirp-hup-spin");
+    helix_log("[HELIX] BUILD: merged utmapp/utm-edition (QEMU 10.0.12, render-server async fences), HVF WFI idle fix, vendored libslirp 4.9.5 (macOS HUP spin fix), ring 1024");
     helix_log("========================================");
     helix_log("[HELIX] Initializing frame export on vsock port %d", vsock_port);
 
