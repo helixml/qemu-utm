@@ -373,8 +373,14 @@ void tcp_sockclosed(struct tcpcb *tp)
          * Starting the timer is contrary to the
          * specification, but if we don't get a FIN
          * we'll hang forever.
+         *
+         * Don't re-arm a timer that is already running: if this is
+         * called repeatedly for the same connection, re-arming keeps
+         * pushing the deadline out and the connection is never freed.
          */
-        tp->t_timer[TCPT_2MSL] = TCP_LINGERTIME;
+        if (tp->t_timer[TCPT_2MSL] == 0) {
+            tp->t_timer[TCPT_2MSL] = TCP_LINGERTIME;
+        }
         break;
     }
     tcp_output(tp);

@@ -219,8 +219,17 @@ int soread(struct socket *so)
                        errno, g_strerror(errno));
             sofcantrcvmore(so);
 
+            /*
+             * macOS: once the peer has reset a socket whose read side we
+             * already shut down, poll() reports POLLHUP (even if only
+             * POLLOUT was asked for), recv() returns 0, and getpeername()
+             * fails with EINVAL rather than ENOTCONN. The host side is gone
+             * for good, so drop the connection. Treating it as an orderly
+             * close leaves the socket polled forever and spins the main
+             * loop at 100% CPU.
+             */
             if (err == ECONNABORTED || err == ECONNRESET || err == ECONNREFUSED ||
-                err == ENOTCONN || err == EPIPE) {
+                err == ENOTCONN || err == EPIPE || err == EINVAL) {
                 tcp_drop(sototcpcb(so), err);
             } else {
                 tcp_sockclosed(sototcpcb(so));
